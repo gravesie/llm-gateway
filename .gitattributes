@@ -1,0 +1,5 @@
+# Shell scripts and hooks must keep LF endings so they run on Linux — both in CI and in
+# any cloud session that checks this repo out.
+*.sh text eol=lf
+*.py text eol=lf
+scripts/git-hooks/* text eol=lf

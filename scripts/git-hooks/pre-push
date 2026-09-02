@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+#
+# Pre-push gate: nothing reaches GitHub without passing lint and the full test suite,
+# so an unpushed-and-broken state can't sit around as the running test site.
+#
+# Runs on every `git push`. To skip in a genuine emergency:  SKIP_PREPUSH=1 git push
+# A skip must be reported in the session, never used quietly.
+#
+# Activate once per clone with: ./scripts/install-hooks.sh
+#
+# ---- Configure for the project ----------------------------------------------
+# Replace the two command blocks below. Keep them as the *full* suite, not a subset:
+# a partial gate reads as "tests passed" while proving much less.
+
+set -uo pipefail
+
+if [ "${SKIP_PREPUSH:-}" = "1" ]; then
+  echo "pre-push: skipped (SKIP_PREPUSH=1)"
+  exit 0
+fi
+
+cd "$(git rev-parse --show-toplevel)"
+
+# Use the project venv if present, else whatever is on PATH.
+if   [ -x ".venv/Scripts/python.exe" ]; then PY=".venv/Scripts/python.exe"
+elif [ -x ".venv/bin/python" ];        then PY=".venv/bin/python"
+else PY="python"
+fi
+
+echo "pre-push: lint"
+if ! "${PY}" -m ruff check src tests; then   # <-- project's lint command
+  echo "pre-push: lint failed. Fix it, or SKIP_PREPUSH=1 to override." >&2
+  exit 1
+fi
+
+echo "pre-push: tests"
+if ! "${PY}" -m pytest; then                            # <-- project's test command
+  echo "pre-push: tests failed. Fix them, or SKIP_PREPUSH=1 to override." >&2
+  exit 1
+fi
+
+echo "pre-push: all checks passed."
+exit 0

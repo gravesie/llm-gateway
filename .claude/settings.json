@@ -1,0 +1,27 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v python >/dev/null 2>&1 && PY=python || PY=python3; \"$PY\" \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/session_start.py\"",
+            "statusMessage": "Loading session-opening checks..."
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v python >/dev/null 2>&1 && PY=python || PY=python3; \"$PY\" \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/guard_ship.py\"",
+            "statusMessage": "Checking the ship guard..."
+          }
+        ]
+      }
+    ]
+  }
+}

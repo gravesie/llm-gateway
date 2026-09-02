@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.claude/settings.local.json
+.venv/
+.env
+.env.*
+!.env.example
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+costs/*.jsonl
