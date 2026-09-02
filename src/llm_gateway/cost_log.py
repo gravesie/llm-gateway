@@ -29,7 +29,10 @@ ENV_VAR = "LLM_GATEWAY_COST_LOG"
 
 # Bump when the shape of a record changes in a way that a reader must know about, so that
 # a log containing several generations of records can still be parsed correctly.
-SCHEMA_VERSION = 1
+#
+# 2 — "refused" joins the status values. The field list is unchanged, but a reader counting
+#     calls by status would otherwise silently miss calls the spend ceiling declined.
+SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -38,7 +41,10 @@ class CostRecord:
 
     timestamp: str
     workload: str
-    status: str  # "ok" | "error"
+    # "ok" — the provider was called and answered.
+    # "error" — the provider was called and raised.
+    # "refused" — no call was made; the spend ceiling declined it. See ``reason``.
+    status: str
     measured: bool
     model: str | None
     model_resolved: str | None

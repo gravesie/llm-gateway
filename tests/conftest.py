@@ -52,10 +52,28 @@ def clean_environment(monkeypatch):
     """Start every test from a known environment.
 
     A developer's real ``.env`` must not be able to change what the suite asserts, and a
-    test must not be able to append to a real cost log.
+    test must not be able to append to a real cost log. A stray
+    ``LLM_GATEWAY_MONTHLY_BUDGET_GBP`` would be worse still: it would make the suite refuse
+    calls it expects to succeed, or pass them when it expects a refusal.
     """
     monkeypatch.delenv("LLM_GATEWAY_COST_LOG", raising=False)
     monkeypatch.delenv("LLM_GATEWAY_USD_GBP_RATE", raising=False)
+    monkeypatch.delenv("LLM_GATEWAY_MONTHLY_BUDGET_GBP", raising=False)
+    monkeypatch.delenv("LLM_GATEWAY_BYPASS", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def clean_budget_ledger():
+    """Drop the module-level ledger cache between tests.
+
+    ``budget`` caches per-month totals and a file offset across calls on purpose; without
+    this, one test's spend would still be counted in the next.
+    """
+    from llm_gateway import budget
+
+    budget.reset_cache()
+    yield
+    budget.reset_cache()
 
 
 @pytest.fixture

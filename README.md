@@ -14,8 +14,9 @@ allows, and a hard budget ceiling.
 
 ## Using it
 
-At present the library does one thing: it measures. `complete()` is a drop-in replacement
-for `litellm.completion`, with one extra argument.
+The library does two things: it measures what calls cost, and it refuses them once a
+monthly ceiling is reached. `complete()` is a drop-in replacement for
+`litellm.completion`, with one extra argument.
 
 ```python
 from llm_gateway import complete
@@ -61,7 +62,62 @@ long enough to cross into a higher pricing tier. Streaming calls pass through un
 are recorded as `measured: false` — usage is not available until the stream is consumed.
 Each of those is countable in the log rather than silently missing.
 
-Routing, model escalation and budget enforcement are not implemented.
+## The monthly ceiling
+
+Set `LLM_GATEWAY_MONTHLY_BUDGET_GBP` to a number of pounds and a call is refused once
+measured spend for the current calendar month reaches it:
+
+```python
+from llm_gateway import BudgetExceeded, budget_status, complete
+
+status = budget_status()          # no call is made
+print(status.spent_gbp, status.remaining_gbp, status.unpriced_calls)
+
+try:
+    complete(model="claude-haiku-4-5", messages=[...], workload="moto:bulk")
+except BudgetExceeded:
+    ...                           # nothing was sent to the provider
+```
+
+The check happens **before** the provider call, never after. A ceiling applied to money
+already spent is a log entry, not a ceiling.
+
+`BudgetExceeded` and `BudgetMisconfigured` both derive from `GatewayError`, so a caller can
+tell "the gateway declined to spend this" from "the provider failed" without reading
+messages. Set the ceiling to `0` to stop spending entirely; leave it empty for no ceiling.
+
+### It needs the cost log
+
+The cost log is the only record of what this library has spent, so it is the only thing the
+ceiling can be enforced against. Setting `LLM_GATEWAY_MONTHLY_BUDGET_GBP` without
+`LLM_GATEWAY_COST_LOG` refuses every call with `BudgetMisconfigured`, rather than leaving a
+ceiling that appears configured and enforces nothing.
+
+### What the ceiling cannot see
+
+**It only counts spend it could price.** Every call listed under *What it does not measure
+yet* above is billed by the provider and invisible to the total. Those calls are counted, in
+`budget_status().unpriced_calls` and in the refusal message, but never estimated — a guessed
+figure inside a spend cap is the one thing this library cannot afford.
+
+**A workload that is entirely streaming will therefore never trip the ceiling.** If you
+stream, watch `unpriced_calls`.
+
+**It is a ceiling on what the log says, not on the provider's invoice.** Delete or rotate
+the log mid-month and spend resets to zero.
+
+**Two processes can each be under the ceiling and jointly exceed it.** The total is re-read
+from the log before every call, so the window is small — one in-flight call per process —
+but it is real. There is no file locking: a library taking locks inside someone else's
+process is a new failure mode.
+
+### Faults do not stop your calls
+
+A fault in the ceiling itself — an unreadable log, a corrupt line, an I/O error — allows the
+call and is reported in `budget_status().fault`. A ceiling that was successfully computed
+and reached refuses it. Faults fail open; decisions do not. `docs/decisions.md` records why.
+
+Routing and model escalation are not implemented.
 
 ## Consumers
 
