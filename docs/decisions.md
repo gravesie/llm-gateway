@@ -73,3 +73,63 @@ the number of consumers grows.
 
 **Open:** the Python floor is set to 3.10 without confirming what web-auditor and the SEO
 pipeline actually run. Check both and tighten the CI matrix to match.
+
+---
+
+## 2026-09-02 — Cost instrumentation: sourced rates, and null rather than wrong
+
+**Decided:** `complete()` wraps `litellm.completion`, records one JSON object per call to
+`LLM_GATEWAY_COST_LOG`, and reports no cost at all rather than a cost it cannot stand
+behind.
+
+**Rates are transcribed from provider documentation, with the URL and the date read.** No
+figure in `pricing.py` comes from memory. Checked 2026-09-02:
+
+- Anthropic, all Claude models including the caching multipliers.
+  <https://platform.claude.com/docs/en/about-claude/pricing>
+- OpenAI, input / cached input / output.
+  <https://developers.openai.com/api/docs/pricing>
+- OpenAI cache writes, documented as a multiplier rather than a rate: 1.25x uncached input
+  on GPT-5.6 and later, no additional charge before that.
+  <https://developers.openai.com/api/docs/guides/prompt-caching>
+- Google Gemini, including context-cache read rates and the 200k tier split on 2.5 Pro.
+  <https://ai.google.dev/gemini-api/docs/pricing>
+- USD/GBP 1.3555, the rate for 2026-08-28, from the Federal Reserve H.10 release.
+  <https://www.federalreserve.gov/releases/h10/current/>
+
+Every rate that both our table and litellm's catalogue publish was compared and agreed
+exactly. `test_the_table_agrees_with_litellms_independent_catalogue` keeps that true.
+
+**litellm normalises cache tokens into `prompt_tokens`, and pricing that figure directly
+would double-charge every cached token.** Anthropic's API reports `input_tokens` excluding
+cache reads and writes; litellm adds them back in to match OpenAI's convention
+(`litellm/llms/anthropic/chat/transformation.py`). Billable uncached input is therefore
+`prompt_tokens - cached_tokens - cache_creation_tokens`. On a cache-heavy workload — which
+is the point of caching — the naive reading would overstate spend by a large multiple, in a
+direction that looks entirely plausible. `test_cache_tokens_are_not_billed_twice` guards it.
+
+**Where the bill cannot be computed honestly, the cost is `null` and a caveat names why.**
+That covers an unknown model, a rate the provider does not publish, 1-hour cache writes,
+fast mode, non-global `inference_geo`, non-standard service tiers, prompts past a pricing
+tier, and streaming. A null is visible and countable in the log. A base-rate figure quietly
+standing in for a discounted or premium one is not, and this library only has value if its
+numbers are believed.
+
+**Model matching is exact, plus release-date suffix stripping, and nothing looser.** A
+future `claude-opus-5-1` reports no price rather than inheriting Opus 5's rates.
+
+**The FX rate is overridable and always recorded.** `LLM_GATEWAY_USD_GBP_RATE` overrides
+the built-in default; whichever was used is written into every record with its provenance,
+so GBP can be recomputed and a stale-rate run identified afterwards. No network lookup: a
+cost logger that makes its own HTTP calls is a new failure mode inside someone else's
+process, for no gain.
+
+**Rules out:** adding a rate without a source, and returning a base-rate cost when a known
+modifier is active.
+
+**Accepted losses:** Batch API, fast mode, long-context tiers and streaming are unmeasured
+for now. Cross-process append interleaving is not guaranteed on Windows; give separate
+consumers separate log files.
+
+**Open:** whether to price the modifiers above rather than null them. Worth doing once
+there is evidence any consumer actually uses them.
