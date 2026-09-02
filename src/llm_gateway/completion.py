@@ -12,8 +12,12 @@ appends one line to the cost log. The contract, in order of importance:
    first, with the exception type only.
 3. **No prompt or completion text is recorded.** Nothing here reads ``messages`` or
    ``choices``; the record is built from token counts and identifiers.
+4. **The spend ceiling is checked before the call, not after it.** :mod:`.budget` decides;
+   a refusal is recorded like any other outcome and then raised. Point 1 does not apply to
+   it: a refusal is a decision, not a fault, and swallowing it would leave the ceiling
+   unenforced.
 
-Not in scope here: routing, model escalation and budget enforcement. This module measures.
+Not in scope here: routing and model escalation. This module measures, and declines.
 """
 
 from __future__ import annotations
@@ -23,7 +27,7 @@ import time
 from datetime import UTC, datetime
 from typing import Any
 
-from . import cost_log, fx, pricing
+from . import budget, cost_log, fx, pricing
 from .cost_log import CostRecord
 
 __all__ = ["complete"]
@@ -150,10 +154,11 @@ def _build_record(
     status: str,
     requested_model: str | None,
     response: Any,
-    latency_ms: float,
+    latency_ms: float | None,
     kwargs: dict[str, Any],
     streaming: bool,
     error_type: str | None,
+    reason_override: str | None = None,
 ) -> CostRecord:
     """Assemble a record. Every field is named explicitly; none is derived from prompt text."""
     resolved_model = _get(response, "model")
@@ -168,10 +173,17 @@ def _build_record(
 
     measured = status == "ok" and not streaming
     reason: str | None = None
-    if streaming:
+    if status == "refused":
+        # Checked first: a refused call never ran, so why it was refused outranks anything
+        # about how it would have been made.
+        reason = reason_override
+    elif streaming:
         reason = "streaming_not_instrumented"
     elif status == "error":
         reason = "call_failed"
+
+    # A refused call has no duration; zero would read as one that returned instantly.
+    latency = None if latency_ms is None else round(latency_ms, 3)
 
     if not measured:
         # No usable usage figures: a stream has not been consumed yet, and a failed call
@@ -190,7 +202,7 @@ def _build_record(
             output_tokens=None,
             cache_read_tokens=None,
             cache_write_tokens=None,
-            latency_ms=round(latency_ms, 3),
+            latency_ms=latency,
             cost_usd=None,
             cost_gbp=None,
             pricing_source=lookup.source,
@@ -230,7 +242,7 @@ def _build_record(
         output_tokens=tokens["output_tokens"],
         cache_read_tokens=tokens["cache_read_tokens"],
         cache_write_tokens=tokens["cache_write_tokens"],
-        latency_ms=round(latency_ms, 3),
+        latency_ms=latency,
         cost_usd=usd,
         cost_gbp=fx.usd_to_gbp(usd, rate),
         pricing_source=lookup.source,
@@ -271,6 +283,12 @@ def complete(*args: Any, workload: str, **kwargs: Any) -> Any:
     Streaming calls are passed through untouched. Usage is not available until the
     generator has been consumed, so a record is still written but marked ``measured:
     false`` — an unmeasured call should be countable, not missing.
+
+    Raises :class:`~llm_gateway.budget.BudgetExceeded` or
+    :class:`~llm_gateway.budget.BudgetMisconfigured` *instead of* calling the provider when
+    the monthly ceiling says so. Both derive from
+    :class:`~llm_gateway.budget.GatewayError`, so a caller can tell a refusal by this
+    library apart from a failure at the provider.
     """
     import litellm
 
@@ -282,6 +300,30 @@ def complete(*args: Any, workload: str, **kwargs: Any) -> Any:
 
     streaming = bool(kwargs.get("stream"))
     timestamp = datetime.now(UTC)
+
+    # Before the call, never after it. A ceiling applied to money already spent is a log
+    # entry. This is deliberately outside the timing window: the refusal is not a call.
+    try:
+        budget.enforce()
+    except budget.GatewayError as refusal:
+        _record_safely(
+            timestamp=timestamp,
+            workload=label,
+            status="refused",
+            requested_model=requested_model,
+            response=None,
+            latency_ms=None,
+            kwargs=kwargs,
+            streaming=streaming,
+            error_type=type(refusal).__name__,
+            reason_override=(
+                "budget_exceeded"
+                if isinstance(refusal, budget.BudgetExceeded)
+                else "budget_misconfigured"
+            ),
+        )
+        raise
+
     started = time.perf_counter()
 
     try:

@@ -165,3 +165,82 @@ The release job now builds on 3.13 to match the top of the matrix.
 **Still open:** the moto SEO pipeline's Python version has not been checked; it was not
 available from the machine this was decided on. If it runs 3.10, it cannot use this library
 until it moves, and the constraint is litellm's rather than ours.
+
+---
+
+## 2026-09-02 — The spend ceiling: faults fail open, decisions do not
+
+**Decided:** `LLM_GATEWAY_MONTHLY_BUDGET_GBP` is enforced in `budget.py`, checked inside
+`complete()` **before** `litellm.completion` is called. Reaching the ceiling raises
+`BudgetExceeded` and nothing is sent to a provider.
+
+**The rule this resolves.** Three requirements are in tension:
+
+1. The global operating rules require a spend cap to be checked before the metered call,
+   not logged after it.
+2. `CLAUDE.md` requires that "a fault in routing, budgeting or cost logging must never stop
+   a consuming application from making its call".
+3. A cap that fails open is not a cap.
+
+They hold together because (2) and (3) are about different things. A **fault** in the
+machinery — an unreadable log, a corrupt line, an I/O error — allows the call, records the
+reason in `BudgetStatus.fault`, and warns once. A **decision** by the machinery — a total
+computed successfully that reaches the ceiling, or a configuration that makes the ceiling
+unenforceable — refuses it.
+
+**Rules out:** "simplifying" that asymmetry in either direction. Making every path fail open
+leaves a cap that never caps. Making every path fail closed means a corrupt log line can
+take down web-auditor.
+
+---
+
+**A ceiling with no cost log refuses every call.** The cost log is the only record of what
+this library has spent, so it is the only thing a ceiling can be enforced against.
+`LLM_GATEWAY_MONTHLY_BUDGET_GBP` set without `LLM_GATEWAY_COST_LOG` therefore raises
+`BudgetMisconfigured` rather than allowing calls. Setting a budget is a deliberate act; a
+control that is visible in configuration and enforces nothing is worse than no control,
+because it reads as handled. The same applies to a value that cannot be parsed, or a
+negative one — a typo must not leave spend uncapped. `0` is valid and means spend nothing.
+
+**Unpriced calls are counted, never estimated.** `cost_gbp` is null for streaming, unknown
+models and every modifier `pricing.py` declines to guess at. That spend is real and
+invisible to the total. `BudgetStatus.unpriced_calls` carries the count, and it appears in
+the refusal message. **A workload that is entirely streaming will never trip the ceiling** —
+stated in the README rather than left to be discovered. Filling the gap with an estimate
+would put a guessed number inside the one control that has to be believed.
+
+**Months are UTC**, because that is what `timestamp` is written in. A UK consumer thinking
+in local months will see a boundary up to an hour out during BST. Converting per record
+would mean parsing every timestamp on a file that can hold a month of bulk work; the
+month prefix is read directly for the UTC timestamps this library writes, and only a
+foreign-offset timestamp is parsed properly.
+
+**The ledger is read incrementally.** Re-summing the whole log on every call would be
+O(file) per provider call, and the moto SEO pipeline is bulk work. A module-level cache per
+log path holds a byte offset and per-month totals; each check is one `stat`, then a read of
+only the bytes appended since last time. Consequences deliberately accepted:
+
+- Only bytes up to the last newline are consumed, so a read that catches another process
+  mid-append leaves the partial line for next time rather than counting a torn record.
+- Totals are bucketed by month rather than reset, so month rollover costs nothing.
+- A file shorter than the cached offset triggers a full rescan — rotation is detected, not
+  assumed away.
+- The first read in a process is still a full scan. Once per process, and correct.
+
+**No file locking, so the cap has a race window.** Two processes can each read a total under
+the ceiling and both proceed. Re-reading before every call narrows it to one in-flight call
+per process. A library that takes locks inside someone else's process is a new failure mode,
+and `cost_log.py` already declines to solve cross-process interleaving for the same reason.
+
+**`LLM_GATEWAY_BYPASS` will not switch off the ceiling.** It is unimplemented — there is no
+router to bypass — but `test_bypass_does_not_disable_the_ceiling` fixes the decision now.
+A variable that silently disables a spend cap gets set during an incident, which is exactly
+when the cap matters most.
+
+**Accepted losses:** the cap is a ceiling on what the log says, not on the provider's
+invoice; deleting or rotating the log mid-month resets spend to zero. Enforcement is global
+and monthly only — there is no per-workload or per-provider ceiling yet.
+
+**Open:** whether the recording-failure warnings (this module and `completion.py`) should
+exist at all, given the global rule against unprompted logging. Left consistent with what
+`completion.py` already does, and flagged again for review.
