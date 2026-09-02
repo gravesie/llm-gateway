@@ -133,3 +133,35 @@ consumers separate log files.
 
 **Open:** whether to price the modifiers above rather than null them. Worth doing once
 there is evidence any consumer actually uses them.
+
+---
+
+## 2026-09-02 — Python floor raised to 3.11, because litellm cannot import on 3.10
+
+**Decided:** `requires-python = ">=3.11"`, CI matrix `["3.11", "3.13"]`. This closes the
+open question left by the entry above, which set the floor to 3.10 without checking what
+the dependency or the consumers actually needed.
+
+**Why:** litellm 1.99.0 cannot be imported on Python 3.10 at all. `litellm/__init__.py`
+imports, unconditionally, a module that does `from typing import ... NotRequired`, which is
+3.11 and later:
+
+```
+litellm/llms/anthropic/experimental_pass_through/context_management/editors/__init__.py:2
+    from typing import TYPE_CHECKING, Any, Final, Literal, NotRequired, ...
+ImportError: cannot import name 'NotRequired' from 'typing'
+```
+
+This is an upstream packaging bug rather than a choice on our part. litellm declares
+`Requires-Python: >=3.10, <3.15`, so pip installs it on 3.10 without complaint and it then
+fails at import. Every one of our 83 tests errored on the 3.10 CI job for that reason and
+that reason alone; 3.12 was green on the same commit.
+
+**Why 3.11 and not 3.13:** 3.11 is the lowest version that can actually work, so it is the
+honest floor and the right thing to test. 3.13 is added to the matrix because it is what the
+consumers run — web-auditor pins `>=3.13` in its `pyproject.toml`, its CI and its Dockerfile.
+The release job now builds on 3.13 to match the top of the matrix.
+
+**Still open:** the moto SEO pipeline's Python version has not been checked; it was not
+available from the machine this was decided on. If it runs 3.10, it cannot use this library
+until it moves, and the constraint is litellm's rather than ours.

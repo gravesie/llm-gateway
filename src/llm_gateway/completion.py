@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from . import cost_log, fx, pricing
@@ -281,7 +281,7 @@ def complete(*args: Any, workload: str, **kwargs: Any) -> Any:
     requested_model = str(requested_model) if requested_model is not None else None
 
     streaming = bool(kwargs.get("stream"))
-    timestamp = datetime.now(timezone.utc)
+    timestamp = datetime.now(UTC)
     started = time.perf_counter()
 
     try:

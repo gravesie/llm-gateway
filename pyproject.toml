@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "llm-gateway"
 version = "0.1.0"
 description = "In-process LLM routing, fallback and cost instrumentation for PGGI projects"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "litellm>=1.0",
 ]
