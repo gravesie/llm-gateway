@@ -128,7 +128,7 @@ Routing and model escalation are not implemented.
 ## Install
 
 ```
-pip install "llm-gateway @ git+https://github.com/gravesie/llm-gateway.git@v0.1.0"
+pip install "llm-gateway @ git+https://github.com/gravesie/llm-gateway.git@v0.2.0"
 ```
 
 Always a tag, never `main`. `DEPLOY.md` explains why.
