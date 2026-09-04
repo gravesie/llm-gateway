@@ -491,10 +491,11 @@ def test_a_line_longer_than_one_read_block_is_still_folded(limit, cost_log_file,
 def test_bypass_does_not_disable_the_ceiling(limit, cost_log_file, stub_completion, monkeypatch):
     """``LLM_GATEWAY_BYPASS`` is for skipping the router, not the spend cap.
 
-    Nothing reads it yet — routing is a later work unit — so this passes trivially today.
-    It is here so that when routing lands, wiring bypass into the ceiling fails the suite.
-    An env var that silently switches off a spend cap would get set during an incident,
-    which is precisely when the cap matters most.
+    Written before anything read the variable, so that wiring it into the ceiling would
+    fail the suite. It is now wired — see ``TestBypass`` in ``test_routing.py`` — and this
+    is still the test that fixes the decision. An env var that silently switches off a
+    spend cap would get set during an incident, which is precisely when the cap matters
+    most.
     """
     monkeypatch.setenv("LLM_GATEWAY_BYPASS", "1")
     limit(0.5)

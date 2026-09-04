@@ -325,3 +325,57 @@ repeating a mistake in a loop does not flood anything.
 **Rules out:** general-purpose logging of calls, latencies or outcomes. That is what the cost
 log is for. Nothing beyond a fault ever reaches the logger, and no prompt or completion text
 reaches either.
+
+---
+
+## 2026-09-04 — `LLM_GATEWAY_BYPASS` switches off routing, and only routing
+
+**Decided:** `LLM_GATEWAY_BYPASS=1` truncates a ladder to its first rung — one attempt, no
+escalation, no error fallback. `routing.bypass_enabled()` reads it; `completion.py` applies
+it in the same place streaming is applied. Nothing else changes: the spend ceiling is still
+enforced before the call and the cost record is still written. Version 0.4.0.
+
+The variable has been documented in `.env.example` since the first commit and unwired ever
+since, because until PR #4 there was no router to bypass. Its purpose is diagnostic: when a
+consuming application misbehaves, this is how you find out whether the fault is in our
+routing or at the provider, without editing their code.
+
+**The cap and the log are not negotiable.** `test_bypass_does_not_disable_the_ceiling` was
+written into `test_budget.py` before any of this existed, precisely so that wiring bypass
+into the ceiling would fail the suite. It still passes, and `TestBypass` now asserts the
+same thing on the laddered path. An environment variable that silently switches off a spend
+cap gets set during an incident, which is exactly when the cap matters most.
+
+**Bypass changes how many attempts are made, not which model is called.** `resolve_ladder`
+still runs first, so a ladder still wins over an explicit `model=` and still warns when both
+are given; bypass then takes rung 1. The alternative — letting `model=` win under bypass —
+matched the older wording in `.env.example` ("call the named provider directly", written
+before ladders existed) but would mean a diagnostic run called a *different* model from the
+one attempt 1 uses in production. A diagnostic that reproduces a different call is not one.
+`.env.example` has been reworded rather than the behaviour bent to fit it.
+
+**A suppressed ladder is recorded**, as `reason: "bypass_no_escalation"`, and only when
+`ladder_size > 1`. PR #4 decided not to record *why* a chain climbed, on the grounds that it
+is inferable from the previous attempt's `status`. This is not inferable: one `ok` attempt
+against a two-rung ladder looks identical whether the router was bypassed or the predicate
+was satisfied. On a call with no ladder bypass changed nothing, so recording it there would
+put a reason on every line that says nothing about that line. Where both apply, the
+streaming reason wins — it also explains `measured: false`, which a reader needs first.
+
+**Both halves of the on/off list are spelled out.** `1`, `true`, `yes`, `on` are on; `0`,
+`false`, `no`, `off`, empty and unset are off; anything else is off and warns once. The
+usual "any non-empty value is on" shortcut would read the `LLM_GATEWAY_BYPASS=0` that
+`.env.example` ships as *on*, and the person who set it would have no way to tell. Off is
+the safer landing for an unrecognised value because it is the behaviour every other consumer
+gets, but it cannot be silent: someone who set the variable believes the router is off.
+
+**`SCHEMA_VERSION` stays at 3.** No field is added or changes shape; `reason` gains a value,
+and a reader of the log does not enumerate `reason` the way it counts `status`. Recorded here
+because it is a judgement rather than an obvious call — the bar for a bump is "a reader must
+know about this to parse correctly", and a new descriptive string does not meet it.
+
+**Evidence:** nine load-bearing behaviours mutation-tested individually — the truncation,
+the reason branch, its `ladder_size > 1` condition, the on-list, the off-default for an
+unrecognised value, the strip/lowercase, the fail-open guard, and both the ceiling and the
+cost-log write under bypass. Each was removed, the intended test watched to fail, then
+restored. All nine were killed on the first pass. Suite: 209 tests, ruff clean.

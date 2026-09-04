@@ -19,9 +19,12 @@ appends one line to the cost log. The contract, in order of importance:
 5. **Every attempt is recorded separately.** A ladder makes several billable calls, and one
    record for the chain would understate what was spent. Attempts of one call share a
    ``chain_id``; the ceiling is re-checked before each one.
+6. **``LLM_GATEWAY_BYPASS`` switches off routing and nothing else.** It stops the ladder
+   after rung 1, so the call reaching the provider is the one the caller would have made
+   without this library in the way. It does not touch points 4 or 5.
 
 The escalation loop is deliberately ours rather than ``litellm``'s ``fallbacks=``. See
-:mod:`.routing` for why, and for the three judgement calls the loop delegates to it.
+:mod:`.routing` for why, and for the judgement calls the loop delegates to it.
 """
 
 from __future__ import annotations
@@ -168,6 +171,7 @@ def _build_record(
     chain_id: str | None = None,
     attempt: int = 1,
     ladder_size: int = 1,
+    bypassed: bool = False,
 ) -> CostRecord:
     """Assemble a record. Every field is named explicitly; none is derived from prompt text."""
     resolved_model = _get(response, "model")
@@ -193,6 +197,12 @@ def _build_record(
         reason = "streaming_not_escalated" if ladder_size > 1 else "streaming_not_instrumented"
     elif status == "error":
         reason = "call_failed"
+    elif bypassed and ladder_size > 1:
+        # Recorded because it is not inferable. One attempt against a two-rung ladder looks
+        # exactly like a first answer the predicate was happy with; only this says the
+        # router was switched off. On a call with no ladder it changed nothing, so saying
+        # so would be noise on every line.
+        reason = "bypass_no_escalation"
 
     # A refused call has no duration; zero would read as one that returned instantly.
     latency = None if latency_ms is None else round(latency_ms, 3)
@@ -348,6 +358,13 @@ def complete(
     "give me the best you can get". With no ladder there is never an earlier success, so
     provider errors propagate exactly as they always have.
 
+    Setting ``LLM_GATEWAY_BYPASS=1`` in the environment stops the ladder after its first
+    rung, for the whole process: one attempt, no escalation and no fallback, which is the
+    call this library would have made had it never been given a ladder. It is a diagnostic
+    for telling a fault in the routing apart from a fault at the provider, and it changes
+    nothing else — the ceiling is still enforced and every call is still recorded, with
+    ``reason: "bypass_no_escalation"`` on a record whose ladder was suppressed.
+
     Streaming calls are passed through untouched and never escalated — usage and content
     are not available until the generator is consumed. A record is still written, marked
     ``measured: false``, because an unmeasured call should be countable rather than missing.
@@ -379,10 +396,15 @@ def complete(
     if not rungs:
         rungs = [requested_model]
 
+    # LLM_GATEWAY_BYPASS makes this call the plain provider call it would have been without
+    # this library routing it: rung 1, no escalation, no error fallback. It stops there.
+    # The ceiling below is still enforced and the record is still written.
+    bypassed = routing.bypass_enabled()
+
     # Recorded as the ladder the caller *gave*, even when only the first rung is attempted,
     # so the log shows a ladder was supplied and not climbed rather than hiding it.
     ladder_size = len(rungs)
-    attempts = rungs[:1] if streaming else rungs
+    attempts = rungs[:1] if streaming or bypassed else rungs
 
     chain_id = uuid.uuid4().hex
     best: Any = None
@@ -398,6 +420,7 @@ def complete(
             "chain_id": chain_id,
             "attempt": attempt,
             "ladder_size": ladder_size,
+            "bypassed": bypassed,
         }
         timestamp = datetime.now(UTC)
 
