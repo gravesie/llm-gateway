@@ -188,6 +188,24 @@ through untouched, and recorded with reason `streaming_not_escalated`.
 A malformed `ladder` does not raise. The router must fail open, so it degrades to a single
 call and warns. Our validation must never be the thing that stops your call.
 
+### Turning the routing off
+
+Set `LLM_GATEWAY_BYPASS=1` in the environment and a ladder is truncated to its first rung:
+one attempt, no escalation, no fallback. That is the call you would have made had you never
+passed a ladder, which is what makes it useful when something is misbehaving and you need
+to know whether it is the routing or the provider.
+
+It is not a way out of the rest of the library. The spend ceiling is still enforced and
+every call is still recorded — a variable that quietly switched off a spend cap would get
+set during an incident, which is exactly when the cap matters. A record whose ladder was
+suppressed carries reason `bypass_no_escalation`, so the log shows what happened rather
+than looking like a first answer your predicate was happy with. `ladder_size` still reports
+the ladder you gave.
+
+`1`, `true`, `yes` and `on` switch it on; `0`, `false`, `no`, `off`, empty and unset leave
+it off. Anything else is treated as off and warned about — `LLM_GATEWAY_BYPASS=0` must
+never mean "on".
+
 ## Consumers
 
 - **web-auditor** (Hetzner) — page content sent to Claude during an audit.
@@ -197,7 +215,7 @@ call and warns. Our validation must never be the thing that stops your call.
 ## Install
 
 ```
-pip install "llm-gateway @ git+https://github.com/gravesie/llm-gateway.git@v0.3.0"
+pip install "llm-gateway @ git+https://github.com/gravesie/llm-gateway.git@v0.4.0"
 ```
 
 Always a tag, never `main`. `DEPLOY.md` explains why.

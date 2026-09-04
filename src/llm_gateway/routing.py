@@ -1,9 +1,10 @@
 """Deciding which model to try, and whether to try another one.
 
-This module holds the three judgement calls the escalation loop in :mod:`.completion` has
-to make: what the ladder actually is, whether a provider error is worth trying elsewhere,
-and whether the caller wants to climb a rung. The loop itself lives in ``completion.py``;
-what is here is the part worth testing on its own.
+This module holds the judgement calls the escalation loop in :mod:`.completion` has to
+make: what the ladder actually is, whether the router has been switched off, whether a
+provider error is worth trying elsewhere, and whether the caller wants to climb a rung.
+The loop itself lives in ``completion.py``; what is here is the part worth testing on its
+own.
 
 Why the loop is ours
 --------------------
@@ -31,12 +32,27 @@ the package makes: a fault channel, not instrumentation.
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Callable
 from typing import Any
 
-__all__ = ["resolve_ladder", "should_fall_back", "wants_escalation"]
+__all__ = [
+    "BYPASS_ENV_VAR",
+    "bypass_enabled",
+    "resolve_ladder",
+    "should_fall_back",
+    "wants_escalation",
+]
 
 _log = logging.getLogger(__name__)
+
+BYPASS_ENV_VAR = "LLM_GATEWAY_BYPASS"
+
+# Both halves are spelled out on purpose. "Any non-empty value is on" would turn
+# LLM_GATEWAY_BYPASS=0 — which is what .env.example ships — into a switched-on router
+# bypass, and the person who set it would have no way to tell.
+_BYPASS_ON = frozenset({"1", "true", "yes", "on"})
+_BYPASS_OFF = frozenset({"0", "false", "no", "off", ""})
 
 # Fault text already warned about, so a caller making the same mistake on every call in a
 # loop warns once rather than once per call. Mirrors the approach in ``budget``.
@@ -57,6 +73,47 @@ def _warn_once(fault: str) -> None:
         return
     _warned.add(fault)
     _log.warning("llm-gateway routing: %s", fault)
+
+
+def bypass_enabled(environ: dict[str, str] | None = None) -> bool:
+    """Whether ``LLM_GATEWAY_BYPASS`` says to stop climbing ladders.
+
+    Switching it on truncates the ladder to its first rung: one attempt, no escalation, no
+    error fallback. It is a diagnostic — it makes the library get out of the way so that
+    the call reaching the provider is the one the caller would have made without it — and
+    it deliberately changes *nothing else*. The spend ceiling is still enforced and the
+    cost record is still written. A variable that silently disabled a spend cap would get
+    set during an incident, which is exactly when the cap matters most.
+
+    Never raises. Anything unrecognised is treated as off and warned about, on the same
+    reasoning as the rest of this module: our reading of a configuration value must not be
+    what stops someone's call.
+    """
+    try:
+        env = os.environ if environ is None else environ
+        raw = env.get(BYPASS_ENV_VAR)
+        if raw is None:
+            return False
+        value = str(raw).strip().lower()
+    except Exception as exc:
+        _warn_once(
+            f"could not read {BYPASS_ENV_VAR} ({type(exc).__name__}); treating it as unset"
+        )
+        return False
+
+    if value in _BYPASS_ON:
+        return True
+    if value in _BYPASS_OFF:
+        return False
+
+    # Neither on nor off. Off is the documented default and the behaviour every other
+    # consumer gets, so it is the safer of the two to land on — but silently is not good
+    # enough, because someone who set this believes the router is off.
+    _warn_once(
+        f"{BYPASS_ENV_VAR}={raw!r} is not a recognised on/off value; the router is NOT"
+        f" bypassed. Use one of {sorted(_BYPASS_ON)} to switch it on."
+    )
+    return False
 
 
 def _valid_rungs(ladder: Any) -> list[str] | None:

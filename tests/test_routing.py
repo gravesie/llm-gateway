@@ -746,3 +746,230 @@ class TestErrorClassification:
     )
     def test_everything_else_falls_back(self, error):
         assert routing.should_fall_back(error) is True
+
+
+class TestBypass:
+    """``LLM_GATEWAY_BYPASS`` switches off the router, and only the router.
+
+    The variable exists to answer one question during an incident: is this the routing or
+    is this the provider? So it has to make the call reaching litellm the call the caller
+    would have made unrouted — and it has to leave the spend ceiling and the cost log
+    exactly where they were. See ``test_bypass_does_not_disable_the_ceiling`` in
+    ``test_budget.py`` for the other half of that, which predates this work unit.
+    """
+
+    def test_a_ladder_is_truncated_to_its_first_rung(
+        self, cost_log_file, scripted_completion, response_factory, monkeypatch
+    ):
+        monkeypatch.setenv("LLM_GATEWAY_BYPASS", "1")
+        expected = response_factory(response_id="cheap")
+        # Strict by construction: a second attempt would run off the end of the script.
+        calls = scripted_completion(expected)
+
+        returned = complete(
+            messages=[],
+            workload="w",
+            ladder=["claude-haiku-4-5", "claude-sonnet-5"],
+            escalate_when=lambda _response: True,
+        )
+
+        assert returned is expected
+        assert len(calls) == 1
+        assert calls[0]["kwargs"]["model"] == "claude-haiku-4-5"
+
+    def test_the_predicate_is_never_asked(
+        self, cost_log_file, scripted_completion, response_factory, monkeypatch
+    ):
+        """Rung 1 is the top rung under bypass, so there is nothing to judge."""
+        monkeypatch.setenv("LLM_GATEWAY_BYPASS", "1")
+        scripted_completion(response_factory())
+        asked = []
+
+        def predicate(response):
+            asked.append(response)
+            return True
+
+        complete(
+            messages=[],
+            workload="w",
+            ladder=["claude-haiku-4-5", "claude-sonnet-5"],
+            escalate_when=predicate,
+        )
+
+        assert asked == []
+
+    def test_an_error_on_the_first_rung_propagates(
+        self, cost_log_file, scripted_completion, monkeypatch
+    ):
+        """Without bypass a rate limit climbs. With it there is no rung to climb to, so the
+        caller's own error handling gets the error, exactly as with no ladder at all."""
+        monkeypatch.setenv("LLM_GATEWAY_BYPASS", "1")
+        calls = scripted_completion(rate_limited())
+
+        with pytest.raises(litellm_exceptions.RateLimitError):
+            complete(
+                messages=[],
+                workload="w",
+                ladder=["claude-haiku-4-5", "claude-sonnet-5"],
+            )
+
+        assert len(calls) == 1
+        assert read_rows(cost_log_file)[0]["reason"] == "call_failed"
+
+    def test_the_record_says_the_ladder_was_suppressed(
+        self, cost_log_file, scripted_completion, response_factory, monkeypatch
+    ):
+        """Not inferable, so it is recorded. One attempt against a two-rung ladder is
+        otherwise indistinguishable from a first answer the predicate was happy with."""
+        monkeypatch.setenv("LLM_GATEWAY_BYPASS", "1")
+        scripted_completion(response_factory())
+
+        complete(
+            messages=[],
+            workload="w",
+            ladder=["claude-haiku-4-5", "claude-sonnet-5"],
+        )
+
+        row = read_rows(cost_log_file)[0]
+        assert row["reason"] == "bypass_no_escalation"
+        # The ladder the caller gave, not the one attempt made: the log shows a ladder was
+        # supplied and suppressed rather than hiding it.
+        assert row["ladder_size"] == 2
+        assert row["attempt"] == 1
+
+    def test_a_call_with_no_ladder_records_nothing_new(
+        self, cost_log_file, scripted_completion, response_factory, monkeypatch
+    ):
+        """Bypass changed nothing here, so saying so would be a reason on every line."""
+        monkeypatch.setenv("LLM_GATEWAY_BYPASS", "1")
+        scripted_completion(response_factory())
+
+        complete(model="claude-haiku-4-5", messages=[], workload="w")
+
+        assert read_rows(cost_log_file)[0]["reason"] is None
+
+    def test_the_call_is_still_measured_and_logged(
+        self, cost_log_file, scripted_completion, response_factory, monkeypatch
+    ):
+        """The half of the contract that is easiest to break by accident: bypass must never
+        take the cost log with it."""
+        monkeypatch.setenv("LLM_GATEWAY_BYPASS", "1")
+        scripted_completion(response_factory())
+
+        complete(
+            messages=[],
+            workload="w",
+            ladder=["claude-haiku-4-5", "claude-sonnet-5"],
+        )
+
+        row = read_rows(cost_log_file)[0]
+        assert row["measured"] is True
+        assert row["cost_gbp"] > 0
+
+    def test_the_ceiling_is_still_enforced(
+        self, cost_log_file, scripted_completion, response_factory, monkeypatch
+    ):
+        """The same decision as ``test_bypass_does_not_disable_the_ceiling``, asserted here
+        against a laddered call so that the routing path is covered too."""
+        cost_log_file.parent.mkdir(parents=True, exist_ok=True)
+        scripted_completion(response_factory())
+        complete(model="claude-haiku-4-5", messages=[], workload="w")
+
+        monkeypatch.setenv("LLM_GATEWAY_BYPASS", "1")
+        monkeypatch.setenv("LLM_GATEWAY_MONTHLY_BUDGET_GBP", "0.001")
+        budget.reset_cache()
+
+        calls = scripted_completion(response_factory())
+        with pytest.raises(budget.BudgetExceeded):
+            complete(
+                messages=[],
+                workload="w",
+                ladder=["claude-haiku-4-5", "claude-sonnet-5"],
+            )
+
+        assert calls == []
+
+    def test_a_stream_keeps_its_own_reason(
+        self, cost_log_file, scripted_completion, monkeypatch
+    ):
+        """Both explanations are true; the streaming one also says why the call is
+        unmeasured, which is what a reader of that record needs first."""
+        monkeypatch.setenv("LLM_GATEWAY_BYPASS", "1")
+        scripted_completion(object())
+
+        complete(
+            messages=[],
+            workload="w",
+            stream=True,
+            ladder=["claude-haiku-4-5", "claude-sonnet-5"],
+        )
+
+        assert read_rows(cost_log_file)[0]["reason"] == "streaming_not_escalated"
+
+    def test_off_leaves_the_ladder_alone(
+        self, cost_log_file, scripted_completion, response_factory, monkeypatch
+    ):
+        """The value shipped in .env.example. If "any value is on" ever creeps in, this is
+        the test that fails."""
+        monkeypatch.setenv("LLM_GATEWAY_BYPASS", "0")
+        calls = scripted_completion(
+            response_factory(response_id="cheap"),
+            response_factory(model="claude-sonnet-5", response_id="dear"),
+        )
+
+        complete(
+            messages=[],
+            workload="w",
+            ladder=["claude-haiku-4-5", "claude-sonnet-5"],
+            escalate_when=lambda response: response.id == "cheap",
+        )
+
+        assert len(calls) == 2
+
+
+class TestBypassValues:
+    """``bypass_enabled`` on its own. Which strings mean on is the whole of its contract."""
+
+    @pytest.mark.parametrize("value", ["1", "true", "yes", "on", "TRUE", "  On  "])
+    def test_recognised_on_values(self, value):
+        assert routing.bypass_enabled({routing.BYPASS_ENV_VAR: value}) is True
+
+    @pytest.mark.parametrize("value", ["0", "false", "no", "off", "", "  ", "FALSE"])
+    def test_recognised_off_values(self, value):
+        assert routing.bypass_enabled({routing.BYPASS_ENV_VAR: value}) is False
+
+    def test_unset_is_off(self):
+        assert routing.bypass_enabled({}) is False
+
+    def test_an_unrecognised_value_is_off_and_says_so(self, caplog):
+        """Off is the documented default, but someone who set this believes the router is
+        switched off, so it cannot be silent."""
+        with caplog.at_level(logging.WARNING, logger="llm_gateway.routing"):
+            assert routing.bypass_enabled({routing.BYPASS_ENV_VAR: "maybe"}) is False
+
+        assert "not a recognised on/off value" in caplog.text
+        assert "the router is NOT bypassed" in caplog.text
+
+    def test_it_warns_once_rather_than_once_per_call(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="llm_gateway.routing"):
+            for _ in range(3):
+                routing.bypass_enabled({routing.BYPASS_ENV_VAR: "maybe"})
+
+        assert caplog.text.count("not a recognised on/off value") == 1
+
+    def test_it_reads_the_real_environment_by_default(self, monkeypatch):
+        monkeypatch.setenv(routing.BYPASS_ENV_VAR, "1")
+        assert routing.bypass_enabled() is True
+
+    def test_a_fault_reading_the_environment_is_not_a_bypass(self, caplog):
+        """The router fails open, and "open" here means the behaviour every other consumer
+        gets — routed — not a silently different one."""
+
+        class Awkward(dict):
+            def get(self, *_args, **_kwargs):
+                raise RuntimeError("reading me is a mistake")
+
+        with caplog.at_level(logging.WARNING, logger="llm_gateway.routing"):
+            assert routing.bypass_enabled(Awkward()) is False
+
+        assert "could not read LLM_GATEWAY_BYPASS" in caplog.text

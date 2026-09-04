@@ -30,9 +30,15 @@ model is tried first and the expensive one only when the cheap answer is not goo
     )
 
 Every attempt is billed by the provider and gets its own cost record; the records of one
-call share a ``chain_id``. The spend ceiling is re-checked before each attempt. See
-CLAUDE.md for the rules this package holds to, and docs/decisions.md for why it is shaped
-this way.
+call share a ``chain_id``. The spend ceiling is re-checked before each attempt.
+
+Set ``LLM_GATEWAY_BYPASS=1`` to switch the routing off: a ladder is truncated to its first
+rung, so the call reaching the provider is the one you would have made without this library
+routing it. It is a diagnostic, and it stops there — the ceiling is still enforced and every
+call is still recorded.
+
+See CLAUDE.md for the rules this package holds to, and docs/decisions.md for why it is
+shaped this way.
 """
 
 from .budget import (
@@ -57,4 +63,4 @@ __all__ = [
     "complete",
 ]
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
