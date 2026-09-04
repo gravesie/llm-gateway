@@ -244,3 +244,84 @@ and monthly only — there is no per-workload or per-provider ceiling yet.
 **Open:** whether the recording-failure warnings (this module and `completion.py`) should
 exist at all, given the global rule against unprompted logging. Left consistent with what
 `completion.py` already does, and flagged again for review.
+
+---
+
+## 2026-09-04 — Model escalation: our loop, one cost record per attempt
+
+**Decided:** `complete()` takes `ladder=[...]` (an ordered list of models, cheapest first)
+and `escalate_when=fn` (a caller-supplied predicate). Each attempt is recorded separately,
+attempts of one call share a `chain_id`, and the spend ceiling is re-checked before every
+attempt. `SCHEMA_VERSION` moves to 3 for `chain_id`, `attempt` and `ladder_size`.
+
+**Rules out: `litellm.completion(fallbacks=[...])`.** It works — it routes to
+`completion_with_fallbacks` without needing a `Router`, so no proxy is involved. It is still
+wrong here. litellm's fallback loop is invisible to this wrapper, so three billable attempts
+return one response and produce **one** cost record. Per-attempt records are the entire
+value of this library; a chain that understates spend is worse than no chain, because the
+wrong figure looks completely plausible. The loop is therefore reimplemented in
+`completion.py`, and `fallbacks` is never passed through.
+
+**The predicate is the caller's, and it is guarded.** This library cannot judge whether an
+answer is good enough — that is the consuming application's domain knowledge, not ours — so
+there is no default predicate and no ladder climbs on quality without one. Because it is
+caller code running inside our loop, a predicate that raises causes the response it was
+asked about to be **accepted**: escalating on the strength of a bug spends real money,
+whereas accepting spends nothing more and returns an answer that genuinely arrived. It is
+never called on the top rung, where it could only produce a fault.
+
+**Which errors climb.** Everything except `BadRequestError`, which will fail identically on
+every rung, with `ContextWindowExceededError` carved back in — it subclasses `BadRequestError`
+(verified against litellm 1.99.0) but is the strongest reason there is to move to a larger
+model, so the isinstance order matters and is asserted in the tests. Authentication and
+rate-limit errors do climb, because a ladder may cross providers and a 401 from Anthropic on
+rung 1 says nothing about an OpenAI model on rung 2.
+
+**A paid-for answer is never destroyed.** Two cases, one rule:
+
+- The ceiling refuses attempt 2 after attempt 1 has answered → attempt 1's response is
+  returned, and the refusal is recorded. The ceiling exists to stop *further* spend, not to
+  throw away what the money already spent bought. A refusal on the *first* attempt still
+  raises, because there is nothing to hand back.
+- Attempt 2 fails at the provider after attempt 1 has answered → attempt 1's response is
+  returned. A ladder means "give me the best you can get".
+
+With no ladder there is never an earlier success, so provider errors propagate exactly as
+they did before this change. That is what keeps it backward compatible.
+
+**Streaming is never escalated.** Usage and content do not exist until the generator is
+consumed, so a predicate has nothing to judge and pricing has nothing to price. The first
+rung is used and the record carries reason `streaming_not_escalated` — distinct from
+`streaming_not_instrumented`, so the log says which of the two happened. `ladder_size` still
+records the ladder that was *given*, so the log shows one was supplied and ignored rather
+than hiding it.
+
+**No field records why a chain climbed**, because it is inferable: an attempt with
+`status: "error"` was followed by an error fallback, one with `status: "ok"` by a predicate
+escalation. Adding the field would also force the record write to wait on caller code.
+
+**Evidence:** all seventeen load-bearing behaviours were mutation-tested individually —
+behaviour removed, the intended test watched to fail, behaviour restored. Two tests did not
+fail on the first pass and were wrong rather than the code: one asserted that `**kwargs` was
+not mutated, which is unfalsifiable because Python builds a fresh dict per call; the other
+was masked by a second defensive fallback in `complete()`. Both were replaced with
+assertions against the units themselves. A test that has never been watched to fail is an
+assumption.
+
+---
+
+## 2026-09-04 — The fault logger stays, and routing uses it too
+
+**Decided:** the `logging.warning` calls in `completion.py`, `budget.py` and now `routing.py`
+stay. Flagged on both previous pull requests without a ruling; ruled on now.
+
+The global operating rules say not to add logging unless it is in the brief. The same rules
+say not to swallow exceptions or return silent failures. Both are satisfied by treating this
+as a **fault channel rather than instrumentation**: a standard library logger, no handler
+attached, so it is invisible until a consuming application decides to look and costs nothing
+when it does not. Faults are warned once per distinct fault, not once per call, so a caller
+repeating a mistake in a loop does not flood anything.
+
+**Rules out:** general-purpose logging of calls, latencies or outcomes. That is what the cost
+log is for. Nothing beyond a fault ever reaches the logger, and no prompt or completion text
+reaches either.

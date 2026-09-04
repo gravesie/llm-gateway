@@ -16,18 +16,24 @@ appends one line to the cost log. The contract, in order of importance:
    a refusal is recorded like any other outcome and then raised. Point 1 does not apply to
    it: a refusal is a decision, not a fault, and swallowing it would leave the ceiling
    unenforced.
+5. **Every attempt is recorded separately.** A ladder makes several billable calls, and one
+   record for the chain would understate what was spent. Attempts of one call share a
+   ``chain_id``; the ceiling is re-checked before each one.
 
-Not in scope here: routing and model escalation. This module measures, and declines.
+The escalation loop is deliberately ours rather than ``litellm``'s ``fallbacks=``. See
+:mod:`.routing` for why, and for the three judgement calls the loop delegates to it.
 """
 
 from __future__ import annotations
 
 import logging
 import time
+import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
-from . import budget, cost_log, fx, pricing
+from . import budget, cost_log, fx, pricing, routing
 from .cost_log import CostRecord
 
 __all__ = ["complete"]
@@ -159,6 +165,9 @@ def _build_record(
     streaming: bool,
     error_type: str | None,
     reason_override: str | None = None,
+    chain_id: str | None = None,
+    attempt: int = 1,
+    ladder_size: int = 1,
 ) -> CostRecord:
     """Assemble a record. Every field is named explicitly; none is derived from prompt text."""
     resolved_model = _get(response, "model")
@@ -178,7 +187,10 @@ def _build_record(
         # about how it would have been made.
         reason = reason_override
     elif streaming:
-        reason = "streaming_not_instrumented"
+        # A ladder cannot be climbed for a stream: usage and content are not available until
+        # the generator has been consumed, and the predicate needs both. Say which of the two
+        # happened rather than implying escalation was even considered.
+        reason = "streaming_not_escalated" if ladder_size > 1 else "streaming_not_instrumented"
     elif status == "error":
         reason = "call_failed"
 
@@ -213,6 +225,9 @@ def _build_record(
             reason=reason,
             error_type=error_type,
             response_id=None,
+            chain_id=chain_id,
+            attempt=attempt,
+            ladder_size=ladder_size,
         )
 
     tokens = extract_usage(response)
@@ -253,6 +268,9 @@ def _build_record(
         reason=reason,
         error_type=error_type,
         response_id=str(response_id) if response_id else None,
+        chain_id=chain_id,
+        attempt=attempt,
+        ladder_size=ladder_size,
     )
 
 
@@ -273,16 +291,66 @@ def _record_safely(**record_kwargs: Any) -> None:
         _log.warning("llm-gateway could not record the cost of a call", exc_info=True)
 
 
-def complete(*args: Any, workload: str, **kwargs: Any) -> Any:
+def _call_arguments(
+    args: tuple[Any, ...], kwargs: dict[str, Any], model: str | None
+) -> tuple[tuple[Any, ...], dict[str, Any]]:
+    """Substitute ``model`` wherever the caller happened to put it.
+
+    ``complete()`` is a drop-in for ``litellm.completion``, so the model may have arrived
+    positionally or by keyword. Climbing a ladder means replacing it per attempt, and the
+    caller's own arguments are never mutated — each attempt gets its own copy.
+    """
+    if model is None:
+        return args, kwargs
+    if "model" in kwargs:
+        return args, {**kwargs, "model": model}
+    if args:
+        return (model, *args[1:]), kwargs
+    return args, {**kwargs, "model": model}
+
+
+def complete(
+    *args: Any,
+    workload: str,
+    ladder: list[str] | None = None,
+    escalate_when: Callable[[Any], Any] | None = None,
+    **kwargs: Any,
+) -> Any:
     """Call ``litellm.completion`` and record what it cost.
 
-    Arguments other than ``workload`` are passed straight through, so this is a drop-in
-    replacement for ``litellm.completion``. ``workload`` is required and keyword-only:
-    unattributed spend is the problem this library exists to solve, so there is no default.
+    Arguments other than ``workload``, ``ladder`` and ``escalate_when`` are passed straight
+    through, so this is a drop-in replacement for ``litellm.completion``. ``workload`` is
+    required and keyword-only: unattributed spend is the problem this library exists to
+    solve, so there is no default.
 
-    Streaming calls are passed through untouched. Usage is not available until the
-    generator has been consumed, so a record is still written but marked ``measured:
-    false`` — an unmeasured call should be countable, not missing.
+    **Escalation.** Give ``ladder`` an ordered list of models, cheapest first, and
+    ``escalate_when`` a predicate that returns true when a response is not good enough::
+
+        complete(
+            messages=messages,
+            workload="web-auditor:page-summary",
+            ladder=["claude-haiku-4-5", "claude-sonnet-5"],
+            escalate_when=lambda r: len(r.choices[0].message.content) < 200,
+        )
+
+    Only the caller can judge whether an answer is good enough, so without a predicate a
+    ladder still buys fallback on provider errors but never climbs on quality. Each attempt
+    is billed by the provider and gets its own cost record; the records of one call share a
+    ``chain_id``, and summing ``cost_gbp`` across that chain is what the call really cost.
+
+    The spend ceiling is re-checked before *every* attempt, not just the first. If it
+    refuses an attempt after an earlier one has already answered, that answer is returned
+    rather than discarded — the ceiling exists to stop further spend, not to throw away
+    something already paid for. A refusal on the first attempt still raises, because there
+    is nothing to return.
+
+    Likewise, a later attempt failing never discards an earlier success: a ladder means
+    "give me the best you can get". With no ladder there is never an earlier success, so
+    provider errors propagate exactly as they always have.
+
+    Streaming calls are passed through untouched and never escalated — usage and content
+    are not available until the generator is consumed. A record is still written, marked
+    ``measured: false``, because an unmeasured call should be countable rather than missing.
 
     Raises :class:`~llm_gateway.budget.BudgetExceeded` or
     :class:`~llm_gateway.budget.BudgetMisconfigured` *instead of* calling the provider when
@@ -293,64 +361,111 @@ def complete(*args: Any, workload: str, **kwargs: Any) -> Any:
     import litellm
 
     label = sanitise_workload(workload)
+
     requested_model = kwargs.get("model")
     if requested_model is None and args:
         requested_model = args[0]
     requested_model = str(requested_model) if requested_model is not None else None
 
     streaming = bool(kwargs.get("stream"))
-    timestamp = datetime.now(UTC)
 
-    # Before the call, never after it. A ceiling applied to money already spent is a log
-    # entry. This is deliberately outside the timing window: the refusal is not a call.
+    # Resolving the ladder is our code deciding what to do with the caller's input, and a
+    # bug in it must not be what stops their call. Degrade to the single-model path.
     try:
-        budget.enforce()
-    except budget.GatewayError as refusal:
+        rungs = routing.resolve_ladder(requested_model, ladder)
+    except Exception:
+        _log.warning("llm-gateway could not resolve the model ladder", exc_info=True)
+        rungs = [requested_model]
+    if not rungs:
+        rungs = [requested_model]
+
+    # Recorded as the ladder the caller *gave*, even when only the first rung is attempted,
+    # so the log shows a ladder was supplied and not climbed rather than hiding it.
+    ladder_size = len(rungs)
+    attempts = rungs[:1] if streaming else rungs
+
+    chain_id = uuid.uuid4().hex
+    best: Any = None
+    last_error: BaseException | None = None
+
+    for attempt, model in enumerate(attempts, start=1):
+        call_args, call_kwargs = _call_arguments(args, kwargs, model)
+        record = {
+            "workload": label,
+            "requested_model": model,
+            "kwargs": call_kwargs,
+            "streaming": streaming,
+            "chain_id": chain_id,
+            "attempt": attempt,
+            "ladder_size": ladder_size,
+        }
+        timestamp = datetime.now(UTC)
+
+        # Before the call, never after it. A ceiling applied to money already spent is a log
+        # entry. This is deliberately outside the timing window: the refusal is not a call.
+        try:
+            budget.enforce()
+        except budget.GatewayError as refusal:
+            _record_safely(
+                timestamp=timestamp,
+                status="refused",
+                response=None,
+                latency_ms=None,
+                error_type=type(refusal).__name__,
+                reason_override=(
+                    "budget_exceeded"
+                    if isinstance(refusal, budget.BudgetExceeded)
+                    else "budget_misconfigured"
+                ),
+                **record,
+            )
+            if best is not None:
+                # An earlier rung already answered and was already paid for. Refusing to
+                # spend more is the point; destroying what that money bought is not.
+                return best
+            raise
+
+        started = time.perf_counter()
+
+        try:
+            response = litellm.completion(*call_args, **call_kwargs)
+        except Exception as exc:
+            _record_safely(
+                timestamp=timestamp,
+                status="error",
+                response=None,
+                latency_ms=(time.perf_counter() - started) * 1000,
+                error_type=type(exc).__name__,
+                **record,
+            )
+            last_error = exc
+            if attempt < len(attempts) and routing.should_fall_back(exc):
+                continue
+            if best is not None:
+                return best
+            raise
+
         _record_safely(
             timestamp=timestamp,
-            workload=label,
-            status="refused",
-            requested_model=requested_model,
-            response=None,
-            latency_ms=None,
-            kwargs=kwargs,
-            streaming=streaming,
-            error_type=type(refusal).__name__,
-            reason_override=(
-                "budget_exceeded"
-                if isinstance(refusal, budget.BudgetExceeded)
-                else "budget_misconfigured"
-            ),
-        )
-        raise
-
-    started = time.perf_counter()
-
-    try:
-        response = litellm.completion(*args, **kwargs)
-    except Exception as exc:
-        _record_safely(
-            timestamp=timestamp,
-            workload=label,
-            status="error",
-            requested_model=requested_model,
-            response=None,
+            status="ok",
+            response=response,
             latency_ms=(time.perf_counter() - started) * 1000,
-            kwargs=kwargs,
-            streaming=streaming,
-            error_type=type(exc).__name__,
+            error_type=None,
+            **record,
         )
-        raise
 
-    _record_safely(
-        timestamp=timestamp,
-        workload=label,
-        status="ok",
-        requested_model=requested_model,
-        response=response,
-        latency_ms=(time.perf_counter() - started) * 1000,
-        kwargs=kwargs,
-        streaming=streaming,
-        error_type=None,
-    )
-    return response
+        # Asking the predicate on the top rung could only produce a fault: there is nowhere
+        # left to climb, so the answer is the answer either way.
+        if attempt == len(attempts):
+            return response
+        if not routing.wants_escalation(escalate_when, response):
+            return response
+        best = response
+
+    # Only reachable if `attempts` were empty, which `resolve_ladder` does not allow. Kept
+    # so a future change that breaks that invariant fails loudly instead of returning None.
+    if best is not None:
+        return best
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("llm-gateway made no attempt at all; this is a bug in the router")

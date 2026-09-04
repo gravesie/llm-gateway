@@ -19,8 +19,20 @@ cost log, so it requires ``LLM_GATEWAY_COST_LOG`` to be set as well; configured 
 one, calls are refused rather than silently uncapped. :func:`budget_status` reports where
 spend stands without making a call.
 
-Routing and model escalation are not implemented. See CLAUDE.md for the rules this package
-holds to, and docs/decisions.md for why it is shaped this way.
+Give ``ladder`` an ordered list of models and ``escalate_when`` a predicate, and the cheap
+model is tried first and the expensive one only when the cheap answer is not good enough::
+
+    response = complete(
+        messages=messages,
+        workload="web-auditor:page-summary",
+        ladder=["claude-haiku-4-5", "claude-sonnet-5"],
+        escalate_when=lambda r: len(r.choices[0].message.content) < 200,
+    )
+
+Every attempt is billed by the provider and gets its own cost record; the records of one
+call share a ``chain_id``. The spend ceiling is re-checked before each attempt. See
+CLAUDE.md for the rules this package holds to, and docs/decisions.md for why it is shaped
+this way.
 """
 
 from .budget import (
@@ -45,4 +57,4 @@ __all__ = [
     "complete",
 ]
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

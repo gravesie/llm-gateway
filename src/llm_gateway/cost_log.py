@@ -32,7 +32,10 @@ ENV_VAR = "LLM_GATEWAY_COST_LOG"
 #
 # 2 — "refused" joins the status values. The field list is unchanged, but a reader counting
 #     calls by status would otherwise silently miss calls the spend ceiling declined.
-SCHEMA_VERSION = 2
+# 3 — chain_id, attempt and ladder_size join the field list. One call to complete() can now
+#     make several billable attempts, so a reader summing cost per logical request has to
+#     group by chain_id rather than counting lines.
+SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -65,6 +68,12 @@ class CostRecord:
     reason: str | None = None
     error_type: str | None = None
     response_id: str | None = None
+    # One call to complete() may climb a ladder of models, and every attempt is billed
+    # separately. These three tie the attempts of one call back together: sum cost_gbp
+    # across a chain_id to get what one logical request actually cost.
+    chain_id: str | None = None
+    attempt: int = 1
+    ladder_size: int = 1
     schema: int = field(default=SCHEMA_VERSION)
 
     def to_json_line(self) -> str:
