@@ -29,7 +29,7 @@ reaches a consumer without passing the gate. Only the last mile differs.
    (install once with `./scripts/install-hooks.sh`).
 3. Push the branch and open a pull request. CI runs lint and the full suite.
 4. Merge to `main` after an explicit go. A green suite is not authorisation to merge.
-5. To cut a release: `git tag -a v0.2.0 -m "..." && git push origin v0.2.0`. CI builds the
+5. To cut a release: `git tag -a v0.3.0 -m "..." && git push origin v0.3.0`. CI builds the
    distribution and attaches it to a GitHub Release.
 
 ## Consuming it
@@ -37,7 +37,7 @@ reaches a consumer without passing the gate. Only the last mile differs.
 Applications install from the tag, never from `main`:
 
 ```
-pip install "llm-gateway @ git+https://github.com/gravesie/llm-gateway.git@v0.2.0"
+pip install "llm-gateway @ git+https://github.com/gravesie/llm-gateway.git@v0.3.0"
 ```
 
 Pinning to `main` would make every merge an uncontrolled production change in

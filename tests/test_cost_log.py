@@ -112,8 +112,33 @@ class TestWriting:
             "reason",
             "error_type",
             "response_id",
+            "chain_id",
+            "attempt",
+            "ladder_size",
         }
         assert set(row) == expected
+
+    def test_the_schema_version_moved_with_the_field_list(self):
+        """Schema 3 added chain_id, attempt and ladder_size.
+
+        Pinned deliberately. A reader summing spend per logical request has to group by
+        chain_id rather than count lines once a ladder can make several billable attempts,
+        and it can only know to do that from the version.
+        """
+        assert cost_log.SCHEMA_VERSION == 3
+
+    def test_a_record_with_no_ladder_still_reads_as_a_chain_of_one(self, tmp_path):
+        """The defaults have to describe a single call honestly, not merely parse.
+
+        Every record carries these fields now, including the overwhelming majority written
+        by callers who never touch escalation.
+        """
+        path = tmp_path / "spend.jsonl"
+        cost_log.write_record(make_record(), path)
+        row = json.loads(path.read_text(encoding="utf-8"))
+
+        assert row["attempt"] == 1
+        assert row["ladder_size"] == 1
 
     def test_the_writer_raises_rather_than_losing_a_record_silently(self, tmp_path):
         """cost_log itself is strict; the fail-open guard lives in the caller."""

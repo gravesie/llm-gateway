@@ -76,6 +76,21 @@ def clean_budget_ledger():
     budget.reset_cache()
 
 
+@pytest.fixture(autouse=True)
+def clean_routing_warnings():
+    """Drop the module-level set of faults ``routing`` has already warned about.
+
+    Same reason as ``clean_budget_ledger``: the suppression is deliberate in production, so
+    a caller repeating a mistake in a loop warns once rather than once per call. In a test
+    process it would mean the second test to trigger a fault saw no warning at all.
+    """
+    from llm_gateway import routing
+
+    routing.reset_warnings()
+    yield
+    routing.reset_warnings()
+
+
 @pytest.fixture
 def cost_log_file(tmp_path, monkeypatch):
     """Point the cost log at a temporary file and return its path."""

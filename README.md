@@ -14,9 +14,10 @@ allows, and a hard budget ceiling.
 
 ## Using it
 
-The library does two things: it measures what calls cost, and it refuses them once a
-monthly ceiling is reached. `complete()` is a drop-in replacement for
-`litellm.completion`, with one extra argument.
+The library does three things: it measures what calls cost, refuses them once a monthly
+ceiling is reached, and climbs a ladder of models so the expensive one is only used when
+the cheap one is not good enough. `complete()` is a drop-in replacement for
+`litellm.completion`, with one required extra argument.
 
 ```python
 from llm_gateway import complete
@@ -34,7 +35,7 @@ exists to solve, so a call cannot opt out of being labelled.
 Set `LLM_GATEWAY_COST_LOG` and every call appends a line like this:
 
 ```json
-{"schema":1,"timestamp":"2026-09-02T12:34:56.789012+00:00","workload":"web-auditor:page-summary",
+{"schema":3,"timestamp":"2026-09-02T12:34:56.789012+00:00","workload":"web-auditor:page-summary",
  "status":"ok","measured":true,"model":"claude-haiku-4-5","provider":"anthropic",
  "input_tokens":1200,"output_tokens":340,"cache_read_tokens":8000,"cache_write_tokens":2000,
  "latency_ms":1843.2,"cost_usd":0.0062,"cost_gbp":0.00457,"pricing_source":"gateway_table",
@@ -117,7 +118,75 @@ A fault in the ceiling itself — an unreadable log, a corrupt line, an I/O erro
 call and is reported in `budget_status().fault`. A ceiling that was successfully computed
 and reached refuses it. Faults fail open; decisions do not. `docs/decisions.md` records why.
 
-Routing and model escalation are not implemented.
+## Routing and model escalation
+
+Give `ladder` an ordered list of models, cheapest first, and `escalate_when` a predicate
+that returns true when a response is not good enough:
+
+```python
+response = complete(
+    messages=[{"role": "user", "content": "..."}],
+    workload="web-auditor:page-summary",
+    ladder=["claude-haiku-4-5", "claude-sonnet-5"],
+    escalate_when=lambda r: len(r.choices[0].message.content) < 200,
+)
+```
+
+Only you can judge whether an answer is good enough — that is your domain knowledge, not
+this library's — so without a predicate a ladder never climbs on quality. It still falls
+back on provider errors.
+
+### Every attempt is recorded
+
+A ladder makes several billable calls, and one record for the chain would understate what
+was spent. Each attempt gets its own record, and the records of one call share a
+`chain_id`:
+
+```
+{"status":"ok","model":"claude-haiku-4-5","cost_gbp":<cheap>, "chain_id":"9f2c…","attempt":1,"ladder_size":2}
+{"status":"ok","model":"claude-sonnet-5", "cost_gbp":<dearer>,"chain_id":"9f2c…","attempt":2,"ladder_size":2}
+```
+
+(Shape only — the real figures come from `pricing.py`, where every rate carries its source
+URL and the date it was checked.)
+
+Sum `cost_gbp` across a `chain_id` to get what one logical request cost. You can also read
+*why* it climbed without another field: if an attempt's `status` is `error`, the next one
+was an error fallback; if it is `ok`, your predicate asked for the climb.
+
+This is why the loop is ours rather than `litellm.completion(fallbacks=[...])`. That works,
+but litellm's fallback loop is invisible to this wrapper, so several paid attempts come
+back as one response and produce one record. `docs/decisions.md` has the detail.
+
+### Which errors climb
+
+Everything except a `BadRequestError`, which will fail the same way on every rung. The
+exception is `ContextWindowExceededError` — it subclasses `BadRequestError` but is the best
+reason there is to move to a larger model, so it does climb.
+
+Authentication and rate-limit errors climb too. That looks wrong until you remember a
+ladder may cross providers: a 401 from Anthropic on rung 1 says nothing about an OpenAI
+model on rung 2.
+
+### The ceiling is re-checked before every attempt
+
+Not just the first. If it refuses an attempt after an earlier one has already answered,
+you get that answer rather than an exception — the ceiling exists to stop further spend,
+not to destroy something already paid for. The refused attempt is still recorded. A
+refusal on the *first* attempt raises, because there is nothing to hand back.
+
+The same rule covers failure: a later attempt erroring never discards an earlier success.
+A ladder means "give me the best you can get". With no ladder there is never an earlier
+success, so provider errors propagate exactly as they always have.
+
+### What a ladder will not do
+
+Streaming calls are never escalated. Usage and content do not exist until the generator is
+consumed, so there is nothing for a predicate to judge. The first rung is used, passed
+through untouched, and recorded with reason `streaming_not_escalated`.
+
+A malformed `ladder` does not raise. The router must fail open, so it degrades to a single
+call and warns. Our validation must never be the thing that stops your call.
 
 ## Consumers
 
@@ -128,7 +197,7 @@ Routing and model escalation are not implemented.
 ## Install
 
 ```
-pip install "llm-gateway @ git+https://github.com/gravesie/llm-gateway.git@v0.2.0"
+pip install "llm-gateway @ git+https://github.com/gravesie/llm-gateway.git@v0.3.0"
 ```
 
 Always a tag, never `main`. `DEPLOY.md` explains why.
