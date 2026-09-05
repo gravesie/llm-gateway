@@ -489,3 +489,90 @@ rescan trigger, the detached rescan, the "workload ceilings alone switch the fea
 condition, the no-log message's variable, the refusal reason, and passing the label to
 `enforce` at all. Each was removed, the intended test watched to fail, then restored. All 24
 were killed. Suite: 249 tests, ruff clean.
+
+## 2026-09-05 — Consumer integration spike: what actually breaks against web-auditor
+
+Nothing in the library was blocked, but nothing had used it either. This is the read-only
+spike that answered "what happens when a real consumer picks it up", run against
+`web-auditor` (the only git-managed LLM consumer that exists) without integrating anything.
+No provider calls were made; every result below is either a local comparison or a check
+against installed source.
+
+**Structured output already works, unchanged.** This was expected to be the blocker and it
+is not. `web-auditor`'s `llm.judge()` uses `anthropic.messages.parse(output_format=Schema)`
+to get a Pydantic-validated response, and `complete()` wraps `litellm.completion`, which has
+no `parse`. But `complete()` is a drop-in, so `response_format=Schema` passes straight
+through, and `litellm.utils.get_optional_params` normalises a raw Pydantic class into
+Anthropic's native `output_format` with `additionalProperties: false` — the same
+structured-outputs feature the SDK's `parse` uses. Verified end-to-end against a stubbed
+provider: the schema reaches litellm, `workload`/`ladder`/`escalate_when` do not leak into
+the provider call, usage extraction still finds the tokens, and a correct cost record is
+written. **No library change is needed to support a schema-driven consumer.**
+
+One trap for whoever tests this next: `AnthropicConfig.map_openai_params` **silently drops a
+raw Pydantic class** and returns `{}`, even with `drop_params=False`. It only understands the
+already-normalised dict form. Probing that method directly says structured output is
+unsupported, which is wrong — the normalisation happens one layer above it. Test through
+`get_optional_params`, not the config method.
+
+**The two pricing tables disagree on `claude-sonnet-5` by 50%, and this must be resolved
+before anything is integrated.** `web-auditor/app/llm_pricing.py` has `$3.00/$15.00` per
+Mtok; this library has `$2.00/$10.00`. On a representative judgement (2,000 in, 500 out) that
+is `$0.0135` against `$0.0090`. Every other model in `web-auditor`'s dropdown matches exactly.
+
+The evidence points at `web-auditor` being stale, but **it has not been confirmed against
+Anthropic's published rates and must be before either table is edited** — the rule in
+CLAUDE.md is that a rate is never stated from memory. What can be said now: this library's
+entry was checked 2026-09-02 and carries a source URL, `web-auditor`'s table was checked
+2026-07-06; this library's entry is a full four-rate record whose cache rates sit at the
+standard Anthropic ratios (write 1.25× input, read 0.1×) and which deliberately prices Sonnet
+5 *below* Sonnet 4.6, while `web-auditor`'s is a two-tuple that reuses the Sonnet 4.x number.
+
+**`web-auditor` prices an unknown model at the Opus rate; this library returns null.** Its
+`_FALLBACK_RATE` is deliberate and documented there as "a stable ceiling rather than one that
+jumps". That is defensible for a display estimate, but the same figure feeds
+`llm._budget_exceeded()`, so a model id the table does not know silently distorts the spend
+gate rather than making it obvious. This is the "null rather than wrong" rule from
+2026-09-02, met head-on in a consumer that chose the opposite. **Do not quietly convert one
+to the other during an integration** — it changes what that consumer's budget means.
+
+**`web-auditor`'s cost estimate ignores cache tokens entirely.** `_record_usage` takes only
+`input_tokens` and `output_tokens`; `cache_read_input_tokens` and
+`cache_creation_input_tokens` are never read. It does not use prompt caching today, so this
+is latent rather than live — but if caching is ever enabled there, its own figures and this
+library's would drift apart, and in opposite directions, because litellm folds cache tokens
+into `prompt_tokens` (see the 2026-09-02 entry) while the Anthropic SDK reports them as
+separate fields. Whether the SDK's `input_tokens` is exclusive of them is *not* settled by
+the type's docstring and needs confirming before anyone relies on the direction of that drift.
+
+**Two ledgers and two budget axes, neither subsuming the other.** `web-auditor` writes
+per-account `LlmUsage` rows to Postgres and caps per account from an admin setting; this
+library writes process-local JSONL and caps per process, globally and per workload label,
+from environment variables. `web-auditor` is multi-worker FastAPI, which is precisely the
+case the 2026-09-02 entry's cross-process caveat covers. **An integration must decide which
+ledger is authoritative rather than running both and hoping they agree** — two spend figures
+that disagree is worse than one, given the only reason this library exists is to be believed.
+
+Their disclosure profiles also differ and should not be merged: `LlmUsage` deliberately
+stores `prompt` and `response_text` for the admin diagnostic screen, while a cost record must
+never contain either. Confirmed on the spike record — it carries token counts, rates and
+identifiers only.
+
+**A kill switch belongs in the consumer, not here.** `LLM_GATEWAY_BYPASS` is not one: by
+design it truncates the ladder to a single rung and keeps the ceilings and the log on (see
+the 2026-09-04 entry). An operator control meaning "stop routing through the gateway
+entirely" is `judge()` choosing the direct provider call it makes today, which is this
+library's own fail-open rule promoted to a setting. Building it as `LLM_GATEWAY_BYPASS`
+would collapse the distinction that entry exists to protect.
+
+**The library is synchronous, and that rules out the obvious smaller consumer.** There is no
+`acompletion` wrapper and no async entry point. `email-warmup` — two `messages.create` calls,
+no schemas, otherwise a far gentler first consumer — uses `AsyncAnthropic` and `await`, so
+adopting it would mean building async support first. It is also not under git. Of the six
+sibling projects, four make no LLM calls at all. **`web-auditor` is the only realistic first
+consumer**, and its LLM surface is one function with about ten call sites, which is a smaller
+target than the size of the codebase suggests.
+
+**Order of work this implies:** settle the Sonnet 5 rate against the published source; decide
+which ledger is authoritative; add the consumer-side kill switch; then integrate `judge()`.
+The structured-output work that looked like a prerequisite is not one.
