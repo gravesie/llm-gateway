@@ -59,6 +59,7 @@ def clean_environment(monkeypatch):
     monkeypatch.delenv("LLM_GATEWAY_COST_LOG", raising=False)
     monkeypatch.delenv("LLM_GATEWAY_USD_GBP_RATE", raising=False)
     monkeypatch.delenv("LLM_GATEWAY_MONTHLY_BUDGET_GBP", raising=False)
+    monkeypatch.delenv("LLM_GATEWAY_WORKLOAD_BUDGETS_GBP", raising=False)
     monkeypatch.delenv("LLM_GATEWAY_BYPASS", raising=False)
 
 

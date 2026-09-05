@@ -12,10 +12,11 @@ appends one line to the cost log. The contract, in order of importance:
    first, with the exception type only.
 3. **No prompt or completion text is recorded.** Nothing here reads ``messages`` or
    ``choices``; the record is built from token counts and identifiers.
-4. **The spend ceiling is checked before the call, not after it.** :mod:`.budget` decides;
-   a refusal is recorded like any other outcome and then raised. Point 1 does not apply to
-   it: a refusal is a decision, not a fault, and swallowing it would leave the ceiling
-   unenforced.
+4. **The spend ceilings are checked before the call, not after it.** :mod:`.budget`
+   decides, against the global monthly ceiling and against any ceiling set for this
+   ``workload``; a refusal is recorded like any other outcome and then raised. Point 1 does
+   not apply to it: a refusal is a decision, not a fault, and swallowing it would leave the
+   ceiling unenforced.
 5. **Every attempt is recorded separately.** A ladder makes several billable calls, and one
    record for the chain would understate what was spent. Attempts of one call share a
    ``chain_id``; the ceiling is re-checked before each one.
@@ -42,10 +43,6 @@ from .cost_log import CostRecord
 __all__ = ["complete"]
 
 _log = logging.getLogger(__name__)
-
-# A label is a routing key for spend analysis, not free text. Long enough for
-# "app:component:operation", short enough that a runaway value cannot bloat the log.
-_MAX_WORKLOAD_LENGTH = 200
 
 # Service tiers that bill at the standard published rate. Anything else changes the price
 # in a way this version does not model.
@@ -83,10 +80,10 @@ def sanitise_workload(workload: Any) -> str:
     """
     if not isinstance(workload, str):
         workload = "" if workload is None else str(workload)
-    workload = workload.strip()
-    if not workload:
-        return "unlabelled"
-    return workload[:_MAX_WORKLOAD_LENGTH]
+    # The same normalisation a per-workload ceiling's configured key gets, so a label and
+    # the key meant to cap it cannot drift apart. See :func:`cost_log.normalise_workload`.
+    label = cost_log.normalise_workload(workload)
+    return label or "unlabelled"
 
 
 def extract_usage(response: Any) -> dict[str, int]:
@@ -301,6 +298,22 @@ def _record_safely(**record_kwargs: Any) -> None:
         _log.warning("llm-gateway could not record the cost of a call", exc_info=True)
 
 
+def _refusal_reason(refusal: budget.GatewayError) -> str:
+    """The ``reason`` recorded for a refused call.
+
+    Which ceiling refused is not inferable from the record — the workload is on the line
+    either way, and only the configuration says whether that workload had its own ceiling.
+    A reader counting refusals needs to tell "this workload is out of money" from
+    "everything is", so the two are separate values rather than one.
+    """
+    if not isinstance(refusal, budget.BudgetExceeded):
+        return "budget_misconfigured"
+    status = refusal.status
+    if status is not None and status.scope == budget.SCOPE_WORKLOAD:
+        return "budget_exceeded_workload"
+    return "budget_exceeded"
+
+
 def _call_arguments(
     args: tuple[Any, ...], kwargs: dict[str, Any], model: str | None
 ) -> tuple[tuple[Any, ...], dict[str, Any]]:
@@ -348,7 +361,12 @@ def complete(
     is billed by the provider and gets its own cost record; the records of one call share a
     ``chain_id``, and summing ``cost_gbp`` across that chain is what the call really cost.
 
-    The spend ceiling is re-checked before *every* attempt, not just the first. If it
+    ``workload`` is also what a per-workload ceiling is matched against. Set
+    ``LLM_GATEWAY_WORKLOAD_BUDGETS_GBP`` and this call is refused once *either* the global
+    monthly ceiling or one set for this label is reached, so one consumer exhausting its
+    own budget does not stop the others. See :mod:`.budget`.
+
+    The spend ceilings are re-checked before *every* attempt, not just the first. If one
     refuses an attempt after an earlier one has already answered, that answer is returned
     rather than discarded — the ceiling exists to stop further spend, not to throw away
     something already paid for. A refusal on the first attempt still raises, because there
@@ -427,7 +445,7 @@ def complete(
         # Before the call, never after it. A ceiling applied to money already spent is a log
         # entry. This is deliberately outside the timing window: the refusal is not a call.
         try:
-            budget.enforce()
+            budget.enforce(workload=label)
         except budget.GatewayError as refusal:
             _record_safely(
                 timestamp=timestamp,
@@ -435,11 +453,7 @@ def complete(
                 response=None,
                 latency_ms=None,
                 error_type=type(refusal).__name__,
-                reason_override=(
-                    "budget_exceeded"
-                    if isinstance(refusal, budget.BudgetExceeded)
-                    else "budget_misconfigured"
-                ),
+                reason_override=_refusal_reason(refusal),
                 **record,
             )
             if best is not None:

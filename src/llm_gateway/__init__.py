@@ -19,6 +19,15 @@ cost log, so it requires ``LLM_GATEWAY_COST_LOG`` to be set as well; configured 
 one, calls are refused rather than silently uncapped. :func:`budget_status` reports where
 spend stands without making a call.
 
+``LLM_GATEWAY_WORKLOAD_BUDGETS_GBP`` adds a ceiling per workload on top of that global one,
+so one consumer running away does not stop the rest::
+
+    LLM_GATEWAY_WORKLOAD_BUDGETS_GBP={"web-auditor":5,"moto:bulk":20}
+
+A key matches a ``workload`` label exactly or as a prefix at a ``:`` boundary, every ceiling
+that matches applies, and the first to refuse stops the call.
+``budget_status(workload=...)`` answers for one label.
+
 Give ``ladder`` an ordered list of models and ``escalate_when`` a predicate, and the cheap
 model is tried first and the expensive one only when the cheap answer is not good enough::
 
@@ -63,4 +72,4 @@ __all__ = [
     "complete",
 ]
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"

@@ -379,3 +379,113 @@ the reason branch, its `ladder_size > 1` condition, the on-list, the off-default
 unrecognised value, the strip/lowercase, the fail-open guard, and both the ceiling and the
 cost-log write under bypass. Each was removed, the intended test watched to fail, then
 restored. All nine were killed on the first pass. Suite: 209 tests, ruff clean.
+
+---
+
+## 2026-09-05 — Per-workload ceilings, layered on the global one
+
+**Decided:** `LLM_GATEWAY_WORKLOAD_BUDGETS_GBP` holds a JSON object mapping a workload label
+to its own monthly ceiling in GBP. It is layered on `LLM_GATEWAY_MONTHLY_BUDGET_GBP`, not a
+replacement: every ceiling that applies to a call is checked before it, and the first to
+refuse stops it.
+
+```
+LLM_GATEWAY_WORKLOAD_BUDGETS_GBP={"web-auditor":5,"moto:bulk":20}
+```
+
+**This supersedes the accepted loss recorded on 2026-09-02** — "Enforcement is global and
+monthly only — there is no per-workload or per-provider ceiling yet". Per-workload now
+exists; per-provider still does not, and the reason is below rather than left as a gap.
+
+**The problem.** One global pot means one runaway consumer takes down every other one. The
+moto SEO pipeline doing bulk catalogue work and web-auditor doing interactive page summaries
+share it: when moto exhausts the month, web-auditor starts raising `BudgetExceeded` for
+spend it did not make. Every cost record already carries the `workload` label `complete()`
+requires, so the attribution needed to separate them was in the log and nothing read it.
+
+**Workload, not provider.** `workload` is given by the caller and is always present.
+A provider is inferred from the model id through litellm's `get_llm_provider` and is `None`
+for anything it does not recognise, which leaves calls a provider ceiling could not attribute
+— and then the choice is between letting them past the cap or refusing them on what is
+really a missing lookup. Both readings corrupt the fault/decision split this module is built
+on. A cap cannot rest on an attribution that is sometimes absent. Per-provider is *not*
+blocked by this design — the ledger and verdict machinery are axis-agnostic — but it needs
+that hole closed first, and it should wait until something actually needs it.
+
+**Rules out:** per-provider ceilings as currently shaped; capping on anything derived rather
+than supplied.
+
+---
+
+**One JSON object, not one variable per workload.** Labels contain `:` and `-`, so mangling
+them into environment-variable names would need an encoding, and an encoding is a second
+thing to get wrong. JSON has a standard parser, gives precise errors, and makes the whole
+configuration one greppable line. A config *file* was considered and rejected: it puts an
+I/O fault path inside a spend cap and creates a second source of truth alongside `.env`.
+
+**Matching is a `:`-boundary prefix, not an exact key.** Labels are documented as
+`app:component:operation`, so a ceiling on `web-auditor` caps everything that application
+does without the operator enumerating its operations — and, more importantly, a new label a
+consumer adds next week is capped by default rather than silently uncapped. Every level that
+matches applies at once. Matching on raw string prefixes would make a ceiling on `web`
+quietly cap `web-auditor`, so the boundary is by segment, not by characters.
+
+**Rules out:** exact-match-only keys; substring matching; wildcards. A label typo on the
+*calling* side is still uncapped by anything but the global ceiling, which is the accepted
+cost of matching by prefix rather than requiring registration.
+
+---
+
+**A refusal reports the global ceiling first; otherwise the tightest is reported.** When the
+global ceiling and a workload's are both out of money, the global one is what a reader needs
+to be told: raising the workload's would not let the call through. When nothing refuses, the
+ceiling with the least headroom is returned, because it is the one that bites next and it is
+what a consumer sizing a batch has to see. Both orderings are individually mutation-tested,
+because either could be flipped without any obvious symptom.
+
+**`BudgetStatus.spent_gbp` is the scope's spend, not always the month's.** `scope` and
+`scope_key` say which ceiling is being reported on. The alternative — always reporting the
+month's total — would make `remaining_gbp` meaningless for the ceiling it sits next to. This
+is a trap if it is not read, so it is stated in the README, in the dataclass docstring and
+here.
+
+**`budget_status()` with no workload answers about the global ceiling.** There is no honest
+per-workload answer for a label nobody named.
+
+**Refusals carry the deciding status.** `GatewayError.status` is set by `enforce()`, so a
+consumer can ask which ceiling stopped it instead of parsing English out of the message,
+and `completion.py` uses it to choose the record's `reason`.
+
+---
+
+**The ledger buckets only configured keys.** A caller is free to invent a label per call, and
+totalling every label ever logged would make a long-running process's memory a function of
+someone else's naming. Attribution therefore happens as lines are folded, against the
+configured key set — which means a change to that set makes the buckets *incomplete* rather
+than merely stale, and forces a full rescan. Config changes are rare; a wrong total inside a
+spend cap is not survivable.
+
+**A rescan publishes only when it succeeds.** It reads into a detached ledger and swaps it in
+afterwards. Clearing the cached totals first would mean an I/O fault during a configuration
+change fell back to zero spend — a blip re-opening the tap, which is exactly the failure the
+2026-09-02 entry rules out.
+
+**`SCHEMA_VERSION` stays at 3.** No field is added or changes shape; `reason` gains
+`budget_exceeded_workload`. Same judgement as the bypass work: the bar for a bump is "a
+reader must know about this to parse correctly", and a new descriptive string does not meet
+it. Which ceiling refused is recorded rather than left inferable, because it genuinely is not
+— the label is on the line either way, and only the configuration says whether that label had
+a ceiling of its own.
+
+**Accepted losses:** a ceiling is still enforced against what the log says, not the invoice;
+the cross-process race is unchanged and now spans two axes rather than one; a workload no key
+names is capped only by the global ceiling; and a label typo at the call site produces spend
+attributed to a label nothing governs.
+
+**Evidence:** 24 load-bearing behaviours mutation-tested individually — every branch of the
+config parser, both halves of the matching rule, label and key normalisation, spend and
+unpriced attribution, the bucket-only-configured-keys bound, both orderings in `_decide`, the
+rescan trigger, the detached rescan, the "workload ceilings alone switch the feature on"
+condition, the no-log message's variable, the refusal reason, and passing the label to
+`enforce` at all. Each was removed, the intended test watched to fail, then restored. All 24
+were killed. Suite: 249 tests, ruff clean.

@@ -87,12 +87,50 @@ already spent is a log entry, not a ceiling.
 tell "the gateway declined to spend this" from "the provider failed" without reading
 messages. Set the ceiling to `0` to stop spending entirely; leave it empty for no ceiling.
 
+### Per-workload ceilings
+
+The ceiling above is global: one consumer exhausting it stops every other one. Set
+`LLM_GATEWAY_WORKLOAD_BUDGETS_GBP` to give a workload its own ceiling as well.
+
+```
+LLM_GATEWAY_WORKLOAD_BUDGETS_GBP={"web-auditor":5,"moto:bulk":20}
+```
+
+A key matches the `workload` label exactly, or as a prefix at a `:` boundary. `web-auditor`
+caps everything that application does; `web-auditor:crawl` caps only that operation; set
+both and both apply. Matching is by segment, so a ceiling on `web` does **not** cap
+`web-auditor`.
+
+Every ceiling that applies is checked, and the first to refuse stops the call — a workload
+under its own ceiling is still refused once the global one is reached. `0` is valid and
+stops that workload alone. A workload no key names is capped only by the global ceiling.
+
+```python
+status = budget_status(workload="moto:bulk")
+print(status.scope, status.scope_key, status.remaining_gbp)   # workload moto 18.4
+```
+
+**`spent_gbp` belongs to the ceiling being reported on.** When `scope` is `"workload"` it is
+that workload's spend for the month, not the month's total. With nothing refusing, the
+ceiling with the least headroom is reported, because that is the one that bites next.
+`budget_status()` with no `workload` answers about the global ceiling: there is no honest
+per-workload answer for a label that was not named.
+
+`BudgetExceeded` and `BudgetMisconfigured` carry the deciding status as `.status`, so a
+caller can tell which ceiling stopped it without reading the message. A refused call is
+recorded with `reason: "budget_exceeded_workload"` rather than `"budget_exceeded"`.
+
+There is no per-provider ceiling, deliberately. `workload` is given by the caller and is
+always present; a provider is inferred from the model id and is unknown for models litellm
+does not recognise, and a spend cap cannot rest on an attribution that is sometimes missing.
+
 ### It needs the cost log
 
-The cost log is the only record of what this library has spent, so it is the only thing the
-ceiling can be enforced against. Setting `LLM_GATEWAY_MONTHLY_BUDGET_GBP` without
-`LLM_GATEWAY_COST_LOG` refuses every call with `BudgetMisconfigured`, rather than leaving a
-ceiling that appears configured and enforces nothing.
+The cost log is the only record of what this library has spent, so it is the only thing a
+ceiling can be enforced against. Setting `LLM_GATEWAY_MONTHLY_BUDGET_GBP` or
+`LLM_GATEWAY_WORKLOAD_BUDGETS_GBP` without `LLM_GATEWAY_COST_LOG` refuses every call with
+`BudgetMisconfigured`, rather than leaving a ceiling that appears configured and enforces
+nothing. So does a value that cannot be parsed — a typo must not leave spend uncapped.
 
 ### What the ceiling cannot see
 
@@ -102,7 +140,8 @@ yet* above is billed by the provider and invisible to the total. Those calls are
 figure inside a spend cap is the one thing this library cannot afford.
 
 **A workload that is entirely streaming will therefore never trip the ceiling.** If you
-stream, watch `unpriced_calls`.
+stream, watch `unpriced_calls` — which is that workload's own count when the status is
+reporting on a per-workload ceiling.
 
 **It is a ceiling on what the log says, not on the provider's invoice.** Delete or rotate
 the log mid-month and spend resets to zero.
@@ -215,7 +254,7 @@ never mean "on".
 ## Install
 
 ```
-pip install "llm-gateway @ git+https://github.com/gravesie/llm-gateway.git@v0.4.0"
+pip install "llm-gateway @ git+https://github.com/gravesie/llm-gateway.git@v0.5.0"
 ```
 
 Always a tag, never `main`. `DEPLOY.md` explains why.
