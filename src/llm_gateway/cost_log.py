@@ -23,9 +23,21 @@ import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-__all__ = ["ENV_VAR", "SCHEMA_VERSION", "CostRecord", "log_path", "write_record"]
+__all__ = [
+    "ENV_VAR",
+    "MAX_WORKLOAD_LENGTH",
+    "SCHEMA_VERSION",
+    "CostRecord",
+    "log_path",
+    "normalise_workload",
+    "write_record",
+]
 
 ENV_VAR = "LLM_GATEWAY_COST_LOG"
+
+# A label is a routing key for spend analysis, not free text. Long enough for
+# "app:component:operation", short enough that a runaway value cannot bloat the log.
+MAX_WORKLOAD_LENGTH = 200
 
 # Bump when the shape of a record changes in a way that a reader must know about, so that
 # a log containing several generations of records can still be parsed correctly.
@@ -79,6 +91,18 @@ class CostRecord:
     def to_json_line(self) -> str:
         """Serialise to a single line, newline included."""
         return json.dumps(asdict(self), ensure_ascii=False, separators=(",", ":")) + "\n"
+
+
+def normalise_workload(text: str) -> str:
+    """Put a workload label into the exact form a record stores it in.
+
+    Lives here, rather than beside the caller-facing coercion in ``completion.py``, because
+    two modules have to agree on it. ``budget`` normalises the keys of a per-workload
+    ceiling the same way ``completion`` normalises the label on a call; a key that differed
+    by a trailing space would silently cap nothing, which is the failure mode a spend
+    control can least afford.
+    """
+    return text.strip()[:MAX_WORKLOAD_LENGTH]
 
 
 def log_path(environ: dict[str, str] | None = None) -> Path | None:
