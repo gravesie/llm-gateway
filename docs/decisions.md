@@ -520,13 +520,29 @@ before anything is integrated.** `web-auditor/app/llm_pricing.py` has `$3.00/$15
 Mtok; this library has `$2.00/$10.00`. On a representative judgement (2,000 in, 500 out) that
 is `$0.0135` against `$0.0090`. Every other model in `web-auditor`'s dropdown matches exactly.
 
-The evidence points at `web-auditor` being stale, but **it has not been confirmed against
-Anthropic's published rates and must be before either table is edited** — the rule in
-CLAUDE.md is that a rate is never stated from memory. What can be said now: this library's
-entry was checked 2026-09-02 and carries a source URL, `web-auditor`'s table was checked
-2026-07-06; this library's entry is a full four-rate record whose cache rates sit at the
-standard Anthropic ratios (write 1.25× input, read 0.1×) and which deliberately prices Sonnet
-5 *below* Sonnet 4.6, while `web-auditor`'s is a two-tuple that reuses the Sonnet 4.x number.
+**Checked against the published page on 2026-09-05 and settled: this library is right on all
+four rates and `web-auditor` is wrong.**
+<https://platform.claude.com/docs/en/about-claude/pricing> gives Claude Sonnet 5 as `$2`
+input, `$10` output, `$2.50` 5-minute cache write and `$0.20` cache read — matching
+`_anthropic(2.0, 10.0, 2.50, 0.20)` exactly. No change is needed here, and `_CHECKED` stays
+at 2026-09-02 because only this one model was re-checked; moving it would claim a full audit
+that did not happen.
+
+The interesting part is *why* `web-auditor` is wrong, because it was not carelessness. Its
+table deliberately records "standard (non-introductory) rates... so the estimate is a stable
+ceiling rather than one that jumps when an introductory discount expires", and `$3/$15` was
+the genuinely scheduled post-introductory rate for Sonnet 5. Anthropic then cancelled that
+increase: the page now notes that the launch pricing "announced at launch as introductory
+pricing through August 31, 2026, is now the standard price" and that the rise to `$3/$15` on
+2026-09-01 "will not occur". So a defensible conservative choice made on 2026-07-06 silently
+became a 50% overcharge on 2026-09-01, with nothing at the call site to signal it.
+
+**That is the argument for the `checked` date and source URL on every rate, and it is worth
+keeping in mind whenever the "stable ceiling" instinct resurfaces.** Deliberately pricing
+above the published rate does not fail safe; it fails *quietly*, and it stops looking like a
+choice the moment the person who made it moves on. A dated, sourced rate that is briefly
+stale is recoverable, because the staleness is visible. This is the same reasoning as the
+2026-09-02 "null rather than wrong" rule, arriving from the opposite direction.
 
 **`web-auditor` prices an unknown model at the Opus rate; this library returns null.** Its
 `_FALLBACK_RATE` is deliberate and documented there as "a stable ceiling rather than one that
@@ -573,6 +589,6 @@ sibling projects, four make no LLM calls at all. **`web-auditor` is the only rea
 consumer**, and its LLM surface is one function with about ten call sites, which is a smaller
 target than the size of the codebase suggests.
 
-**Order of work this implies:** settle the Sonnet 5 rate against the published source; decide
+**Order of work this implies:** the Sonnet 5 rate is now settled (fix it in `web-auditor`); decide
 which ledger is authoritative; add the consumer-side kill switch; then integrate `judge()`.
 The structured-output work that looked like a prerequisite is not one.
