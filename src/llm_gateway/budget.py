@@ -37,6 +37,25 @@ and in the refusal message, but never estimated: a guessed figure inside a spend
 one thing this library cannot afford. A workload that is entirely streaming will never trip
 the ceiling.
 
+A brake, not an accounting control
+----------------------------------
+
+The check is not atomic with the spend it is checking. :func:`enforce` reads the ledger, the
+provider call is made, and the cost record is appended afterwards; nothing holds across
+those three steps. ``_lock`` makes the ledger *read* thread-safe within one process — it
+does not span the read-call-write sequence, so it does not close this window.
+
+The consequence is that calls already in flight when a ceiling is crossed have each passed a
+check none of them has paid for yet, and the ceiling is overshot by roughly the number of
+concurrent calls times what each costs. That is one call in a single-threaded batch and more
+in a multi-worker server. There is no file locking, deliberately: a library taking locks
+inside someone else's process is a new failure mode.
+
+So this is a brake on runaway spend, not a guarantee that a number cannot be exceeded, and
+the cost log it reads is this library's own measurement rather than a billing ledger. Where
+a consuming application keeps its own record of spend, that record stays authoritative. See
+``docs/decisions.md``, 2026-09-05.
+
 Fail open, but only for faults
 ------------------------------
 
