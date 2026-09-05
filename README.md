@@ -146,10 +146,19 @@ reporting on a per-workload ceiling.
 **It is a ceiling on what the log says, not on the provider's invoice.** Delete or rotate
 the log mid-month and spend resets to zero.
 
-**Two processes can each be under the ceiling and jointly exceed it.** The total is re-read
-from the log before every call, so the window is small — one in-flight call per process —
-but it is real. There is no file locking: a library taking locks inside someone else's
-process is a new failure mode.
+**The check is not atomic with the spend, so concurrent calls can overshoot it.** The
+ceiling is read before the call and the cost is recorded after it, and nothing holds across
+those steps — so calls already in flight when the ceiling is crossed have each passed a
+check that none of them has paid for yet. The overshoot is roughly the number of concurrent
+calls times what each costs: one call in a single-threaded batch, more in a multi-worker or
+multi-threaded server. There is no file locking, and the ledger read being thread-safe does
+not close this window. A library taking locks inside someone else's process is a new failure
+mode, and `docs/decisions.md` explains why that trade is deliberate.
+
+**Treat the ceiling as a brake, not an accounting control**, and the log as this library's
+own measurement rather than your books. If your application already records LLM spend — a
+usage table, a billing ledger — that record stays authoritative and this one does not
+replace it. See *The cost log is not a system of record* in `docs/decisions.md`.
 
 ### Faults do not stop your calls
 
@@ -247,8 +256,13 @@ never mean "on".
 
 ## Consumers
 
-- **web-auditor** (Hetzner) — page content sent to Claude during an audit.
-- **moto SEO pipeline** — bulk catalogue work.
+**Nothing uses this library yet.** It is built and released, and integration has not
+happened.
+
+- **web-auditor** (Hetzner) — the intended first consumer: page content sent to Claude
+  during an audit, through a single `llm.judge()` choke point. Its own Postgres usage table
+  stays authoritative for spend; see *The cost log is not a system of record* in
+  `docs/decisions.md`.
 - Local scripts on pete24.
 
 ## Install

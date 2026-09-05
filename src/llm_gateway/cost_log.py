@@ -14,6 +14,11 @@ Concurrency: each record is one ``write()`` of one line to a file opened in appe
 That is safe for many writers in one process. Interleaving between separate processes is
 not guaranteed on Windows, and this module does not attempt to solve it; if two consuming
 applications must share a log, give them a file each.
+
+This log is not a system of record. It is what this library measured, kept so it can
+attribute spend and enforce a ceiling against it. It is not a billing ledger and not an
+audit trail, and where a consuming application keeps its own record of LLM spend, that
+record stays authoritative. See ``docs/decisions.md``, 2026-09-05.
 """
 
 from __future__ import annotations

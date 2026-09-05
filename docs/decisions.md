@@ -592,3 +592,59 @@ target than the size of the codebase suggests.
 **Order of work this implies:** the Sonnet 5 rate is now settled (fix it in `web-auditor`); decide
 which ledger is authoritative; add the consumer-side kill switch; then integrate `judge()`.
 The structured-output work that looked like a prerequisite is not one.
+
+## 2026-09-05 — The cost log is not a system of record
+
+**Decided:** where a consuming application already keeps its own record of LLM spend, that
+record stays authoritative and this library's cost log does not replace it. The log is this
+library's own measurement, kept so it can attribute spend and enforce a ceiling. It is not
+the books.
+
+**Why this needed deciding at all:** the integration spike found `web-auditor` keeping
+per-account `LlmUsage` rows in Postgres, capped per account from its admin UI, while this
+library keeps process-local JSON lines capped per process from environment variables. Both
+are real, neither subsumes the other, and adopting the library naively would have left two
+spend figures for the same calls. **Two figures that disagree are worse than one**, and the
+only reason this library exists is to be believed — so one of them had to be named as the
+answer, in advance, rather than discovered when they diverged.
+
+**Postgres wins on the merits, not by seniority.** It is transactional, it is shared across
+workers by construction, it attributes to an account rather than a process, and an admin
+screen and an alerting path are already built on it. Making the JSON-lines log authoritative
+would mean rebuilding all of that *and* buying a concurrency problem, to replace something
+that works.
+
+**What that makes the ceiling: a local brake, not an accounting control.** Worth stating
+precisely, because "spend cap" invites a stronger reading than the mechanism supports:
+
+- **The check is not atomic with the spend.** `enforce()` reads the ledger, the provider
+  call is made, and the record is appended afterwards. Nothing holds across those three
+  steps. `budget._lock` makes the ledger *read* thread-safe within one process; it does not
+  span the read-call-write sequence, in-process or otherwise.
+- **So concurrent calls can each pass a check that none of them has yet paid for.** The
+  overshoot is bounded by how many calls are in flight when the ceiling is crossed, times
+  what each costs. In a single-threaded batch that is one call. In a multi-worker,
+  multi-threaded server it is not, and the README previously said "one in-flight call per
+  process", which understated it. Corrected in the same commit.
+- **It is a ceiling on what the log says, not on the provider's invoice.** Unchanged, and
+  now the general case of the same point.
+
+**Rules out:** presenting the ceiling as a guarantee that spend cannot exceed a number, and
+presenting the cost log as a billing ledger or an audit trail. It is neither, and both
+readings are easy to fall into from the name.
+
+**Rules out, also:** adding file locking to make the log authoritative *by default*. A
+library taking locks inside someone else's process is a new failure mode, and it would be
+solving a problem this decision removes. If a future consumer genuinely has no ledger of its
+own and needs a hard cap, that is a deliberate piece of work with its own entry — not a
+quiet hardening of this path.
+
+**Accepted losses:** a consumer with no ledger of its own gets a brake and not a guarantee.
+Cross-process append interleaving remains unguaranteed on Windows, so separate consumers
+still want separate files. Neither is new; both are now stated where someone relying on the
+ceiling will actually read them.
+
+**Evidence:** no behaviour change, so nothing to mutation-test. The sequencing claim above
+was read off `completion.py` — `budget.enforce()`, then `litellm.completion()`, then the
+record write — and the lock's scope off `budget.evaluate()`, rather than restated from
+memory. Suite: 249 tests, ruff clean.
