@@ -133,9 +133,30 @@ directories to create: `costs/` exists in neither tree, and the cost log is opt-
 builds. Each worktree gets its own, so the editable install resolves to that worktree's `src`
 and the two trees cannot shadow one another.
 
-**The one real caveat is version drift, and it is not the worktree's fault.** There is no
+**The one caveat in the setup is version drift, and it is not the worktree's fault.** There is no
 lockfile, so a fresh install resolves whatever is newest that day. The test tree came up on
 ruff 0.16.6 against the primary checkout's 0.16.5; litellm, pytest, openai and pydantic
 matched. CI installs the same floating way (`pip install -e ".[dev]"`), so a fresh worktree is
 *closer* to CI than a long-lived checkout is. If a lint error shows up in one tree and not the
 other, this is why — and CI will agree with the fresher one.
+
+**Tearing down is where it bites: `gh pr merge --delete-branch` half-fails from inside a
+worktree, and the failure reads as though the merge failed.** It stops with ``fatal: 'main' is
+already used by worktree at <primary>``, because its post-merge local checkout cannot take
+`main` while the primary tree holds it. **The merge has already succeeded by then.** The error
+is the tidy-up, not the merge. Confirm that before reacting, and never retry the merge on the
+strength of that message — from the primary checkout:
+
+```
+gh pr view <n> --json state,mergeCommit
+git worktree remove <sibling-path>
+git branch -d <branch>
+git push origin --delete <branch>
+```
+
+Neither branch is deleted for you, so both of those last two are needed. `git branch -d` warns
+that the branch is "not yet merged to HEAD" and then deletes it anyway — that is the squash
+merge, since the commit on `main` is not the commit on the branch. It is not a reason to reach
+for `-D`. `git worktree remove` does not need `--force`; the gitignored venv does not block it.
+
+Observed 2026-09-06 on PR #10, which is also the PR that wrote this section.
