@@ -52,7 +52,7 @@ One working tree per session — never run two sessions against the same checkou
 another session moved the tree since it was taken. Use `git worktree add -b <branch>
 <sibling-path> main`. What a fresh worktree needs beyond the checkout itself —
 dependency installs, `.env`, local data directories — is project-specific; see
-"Project-specific rules" below.
+"Fresh worktree" below.
 
 ## Planning
 
@@ -105,6 +105,37 @@ crashes. The only reason this library exists is to be believed.
 
 ## Fresh worktree
 
-Untested as of 2026-09-02. The expected recipe is a venv, an editable install of the dev
-extra, and a copy of `.env` from the primary checkout. Confirm it works and then record
-what actually happened here, replacing this paragraph. Do not treat the above as tested.
+Tested 2026-09-06 on Windows 11, cutting a worktree from the primary checkout at `0d74b37`.
+The recipe works, and it is shorter than the one this section used to predict — three
+commands, no `.env`:
+
+```
+git worktree add -b <branch> <sibling-path> main
+cd <sibling-path> && python -m venv .venv
+.venv/Scripts/python.exe -m pip install -e ".[dev]"
+```
+
+That is the whole thing. 249 tests passed and `ruff check src tests` came back clean in a tree
+that had never seen a `.env`. Budget about three minutes: the worktree is instant, the venv
+12s, the install 2m31s, the suite 15s.
+
+**There is no `.env` to copy, and the suite does not want one.** The primary checkout has
+never had one — only the committed `.env.example`. Provider calls in tests are mocked and
+`tests/conftest.py` blocks the network at three layers, so a credential would have nothing to
+do. The old claim that you copy `.env` across was wrong: it was reasoning from projects that
+have a runtime, and this one does not. Copy a `.env` only to hand-run something against a real
+provider, which is not something the suite ever does.
+
+**Nothing else is missing either.** `.claude/` — hooks, `settings.json`, workflows — is
+tracked, so the guard hook is live in a fresh worktree with no setup. There are no local data
+directories to create: `costs/` exists in neither tree, and the cost log is opt-in via
+`LLM_GATEWAY_COST_LOG`. The only untracked thing worth having is the venv, which step two
+builds. Each worktree gets its own, so the editable install resolves to that worktree's `src`
+and the two trees cannot shadow one another.
+
+**The one real caveat is version drift, and it is not the worktree's fault.** There is no
+lockfile, so a fresh install resolves whatever is newest that day. The test tree came up on
+ruff 0.16.6 against the primary checkout's 0.16.5; litellm, pytest, openai and pydantic
+matched. CI installs the same floating way (`pip install -e ".[dev]"`), so a fresh worktree is
+*closer* to CI than a long-lived checkout is. If a lint error shows up in one tree and not the
+other, this is why — and CI will agree with the fresher one.
