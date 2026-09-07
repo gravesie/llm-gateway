@@ -75,7 +75,7 @@ status = budget_status()          # no call is made
 print(status.spent_gbp, status.remaining_gbp, status.unpriced_calls)
 
 try:
-    complete(model="claude-haiku-4-5", messages=[...], workload="moto:bulk")
+    complete(model="claude-haiku-4-5", messages=[...], workload="web-auditor:crawl")
 except BudgetExceeded:
     ...                           # nothing was sent to the provider
 ```
@@ -87,13 +87,22 @@ already spent is a log entry, not a ceiling.
 tell "the gateway declined to spend this" from "the provider failed" without reading
 messages. Set the ceiling to `0` to stop spending entirely; leave it empty for no ceiling.
 
+**Catch the two separately, though. They are not the same event.** `BudgetExceeded` is the
+ceiling working: the limit you set was reached, nothing is broken, and a consumer is right to
+treat it quietly. `BudgetMisconfigured` is an operator fault — a ceiling that cannot be
+enforced as configured — and it refuses **every** call until someone corrects an environment
+variable. A consumer that catches `GatewayError` and treats the whole family as "we declined
+to spend this" will silently degrade every request behind a log line, with no alert and a
+switch still reading as healthy. The first real integration did exactly that; see *What the
+first real integration taught* in `docs/decisions.md`.
+
 ### Per-workload ceilings
 
 The ceiling above is global: one consumer exhausting it stops every other one. Set
 `LLM_GATEWAY_WORKLOAD_BUDGETS_GBP` to give a workload its own ceiling as well.
 
 ```
-LLM_GATEWAY_WORKLOAD_BUDGETS_GBP={"web-auditor":5,"moto:bulk":20}
+LLM_GATEWAY_WORKLOAD_BUDGETS_GBP={"web-auditor":25,"web-auditor:crawl":10}
 ```
 
 A key matches the `workload` label exactly, or as a prefix at a `:` boundary. `web-auditor`
@@ -106,8 +115,8 @@ under its own ceiling is still refused once the global one is reached. `0` is va
 stops that workload alone. A workload no key names is capped only by the global ceiling.
 
 ```python
-status = budget_status(workload="moto:bulk")
-print(status.scope, status.scope_key, status.remaining_gbp)   # workload moto 18.4
+status = budget_status(workload="web-auditor:crawl")
+print(status.scope, status.scope_key, status.remaining_gbp)   # workload web-auditor:crawl 8.4
 ```
 
 **`spent_gbp` belongs to the ceiling being reported on.** When `scope` is `"workload"` it is
@@ -256,14 +265,22 @@ never mean "on".
 
 ## Consumers
 
-**Nothing uses this library yet.** It is built and released, and integration has not
-happened.
+**web-auditor is the first consumer, integrated 2026-09-06** (its PR #409, deployed). Page
+content sent to Claude during an audit routes through a single `llm.judge()` choke point,
+which now has two paths: the direct Anthropic SDK call it always made, and `complete()`.
 
-- **web-auditor** (Hetzner) — the intended first consumer: page content sent to Claude
-  during an audit, through a single `llm.judge()` choke point. Its own Postgres usage table
-  stays authoritative for spend; see *The cost log is not a system of record* in
-  `docs/decisions.md`.
-- Local scripts on pete24.
+**It shipped dark.** An operator switch on that application's `/admin/llm` chooses between
+them and defaults to the direct call, so merging the integration moved no traffic. Nothing
+routes through this library until someone turns it on, and the switch is the consumer's, not
+this library's.
+
+Its own Postgres usage table stays authoritative for spend; this library's cost log runs
+alongside it as a second, independent measurement. See *The cost log is not a system of
+record* in `docs/decisions.md`.
+
+`LLM_GATEWAY_COST_LOG` is set there on web, worker and scheduler to one shared file. No
+ceiling is set: that application's own budget gate is still what stops its spend, so this
+library is measurement-only for it today.
 
 ## Install
 
