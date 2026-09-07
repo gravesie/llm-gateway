@@ -807,3 +807,10 @@ which mattered: the first read of the pricing page reported the opposite conclus
 GPT-5.6 has no long tier and only the older models do), and litellm's local catalogue
 contradicted it. Pulling the raw table settled it in litellm's favour. **A single
 natural-language read of a pricing table is not a source; two disagreeing sources are.**
+
+**Version 0.5.1, schema 3 unchanged.** The first release here that is a rate correction
+rather than a feature. It earns a version because it changes observable behaviour — a prompt
+over 272k tokens on `gpt-5.5` or `gpt-5.4` now returns `cost_usd=None` with a caveat where it
+previously returned a number — and a consumer that pinned `v0.5.0` should be able to see that
+in the tag rather than only in a diff. Schema does not move: no new field and no new `status`
+value, and a corrected *rate* was never a schema concern.
