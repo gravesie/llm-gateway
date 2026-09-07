@@ -740,3 +740,77 @@ exception hierarchy was checked against litellm 1.100.0; the import cost measure
 subprocess, because by the time a suite runs something else has usually imported litellm
 already and an in-process measurement passes for the wrong reason. Suite: 249 tests, ruff
 clean, v0.5.0 and schema 3 unchanged.
+
+---
+
+## 2026-09-07 — The full price sweep, and the two shapes a wrong rate arrives in
+
+The first sweep of the whole table since 2026-09-02. `_CHECKED` moves to `2026-09-07`, and
+this time the date is honest — every Anthropic, OpenAI and Gemini entry was read against its
+published source, not one model spot-checked. **This supersedes the 2026-09-05 note above
+that `_CHECKED` stays at 2026-09-02 "because only this one model was re-checked".** That
+constraint was right when written and is now discharged.
+
+**Clean:** all 17 Anthropic rates, 7 of the 9 OpenAI rates, and all 6 existing Gemini rates
+match their sources exactly, on every column. FX is unchanged and correct: the current H.10
+release is dated 2026-08-31 and still carries 1.3555 for 2026-08-28, so `DEFAULT_RATE_DATE`
+was already right. Only the "read on" comment in `fx.py` moved.
+
+**Defect 1 — `gpt-5.5` and `gpt-5.4` were missing their long-context tier, and understated
+the bill.** Both cross the 272k threshold into roughly double input and 1.5x output
+(`$5→$10` and `$30→$45`; `$2.50→$5` and `$15→$22.50`). Neither carried
+`max_priced_prompt_tokens`, so a prompt past the threshold was priced at the *below*-tier
+rate and returned as a confident number with no caveat. That is the precise failure the
+2026-09-02 "null rather than wrong" rule exists to prevent, sitting in the table the rule is
+written above.
+
+The cause is a comment that conflated two independent facts: "GPT-5.6 and later charge 1.25x
+input for cache writes **and** shift to a higher tier above 272k prompt tokens; earlier
+models do neither." The first half is true. The second is not — every model in the OpenAI
+block has the 272k tier. OpenAI just publishes it two ways: as extra columns on the GPT-5.6
+rows, and as a `(<272K context length)` suffix in the row *label* on gpt-5.5 and gpt-5.4.
+The second form reads as "no tier" to anyone scanning columns.
+
+**The lesson is a sibling of the Sonnet 5 one, not a repeat of it.** Sonnet 5 went wrong
+because the *world* changed under a correct reading. This went wrong because the *table
+layout* differs between model families within one vendor's page, and a reading correct for
+one family was carried to another. Both produce a confidently wrong number from an honest
+process, which is why neither is caught by re-reading our own table — only by re-reading
+theirs. **Rules out:** trusting a per-family generalisation about pricing structure without
+checking it against each row.
+
+**Defect 2 — `gemini-3.8-flash` launched after the previous sweep and was absent.** It priced
+anyway, through litellm's catalogue, at `checked=None` with the "not independently verified"
+note. That is the fallback behaving exactly as designed, and it is also how a stale table
+hides: nothing errors, nothing is obviously wrong, and the provenance quietly degrades. Now a
+table entry, verified against the published page. Rates match 3.7 and 3.6 Flash.
+
+**Two note strings were also corrected** — `_PROMO` claimed only the *input* rate was
+promotional when input, output and cache read all are and all double on 2027-01-01, and the
+`gemini-2.5-pro` note listed the above-threshold input and cache-read rates but not output.
+Neither produced a wrong number. Both would have misinformed whoever read them next.
+
+**A second copy of the check date was deleted rather than updated.** `pricing.py` carried
+"Read 2026-09-02" in a comment beside `_ANTHROPIC_SOURCE` as well as in `_CHECKED`, and
+`tests/test_complete.py` asserted the date as a literal. The comment now points at
+`_CHECKED`, and the test asserts against the constant — what it is really testing is that the
+record carries the table's date through, not what that date is. A duplicated date does not
+stay duplicated; it drifts, and it drifted.
+
+**Evidence:** 257 tests (up from 249), ruff clean. Four mutations, four killed, file restored
+byte-identical each time: drop the tier from gpt-5.5, drop it from gpt-5.4, delete the
+gemini-3.8-flash entry, and — the one worth writing — "fix" gpt-5.5 by putting the
+*above*-threshold rates in the table instead of adding a tier. That last mutant is the
+plausible wrong repair, and it is killed by three separate tests including the pre-existing
+litellm cross-check. The OpenAI finding was cross-checked two ways before any code changed,
+which mattered: the first read of the pricing page reported the opposite conclusion (that
+GPT-5.6 has no long tier and only the older models do), and litellm's local catalogue
+contradicted it. Pulling the raw table settled it in litellm's favour. **A single
+natural-language read of a pricing table is not a source; two disagreeing sources are.**
+
+**Version 0.5.1, schema 3 unchanged.** The first release here that is a rate correction
+rather than a feature. It earns a version because it changes observable behaviour — a prompt
+over 272k tokens on `gpt-5.5` or `gpt-5.4` now returns `cost_usd=None` with a caveat where it
+previously returned a number — and a consumer that pinned `v0.5.0` should be able to see that
+in the tag rather than only in a diff. Schema does not move: no new field and no new `status`
+value, and a corrected *rate* was never a schema concern.

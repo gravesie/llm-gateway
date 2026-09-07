@@ -37,7 +37,8 @@ __all__ = [
 ]
 
 # Anthropic publishes a single table for every Claude model, including the prompt-caching
-# multipliers. Read 2026-09-02.
+# multipliers. Read on the date in ``_CHECKED``, which is the one place that date lives —
+# a second copy here drifts, and did.
 _ANTHROPIC_SOURCE = "https://platform.claude.com/docs/en/about-claude/pricing"
 
 # OpenAI publishes input / cached input / output on the pricing page. The cache-write
@@ -56,7 +57,7 @@ _LITELLM_SOURCE = (
     "https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json"
 )
 
-_CHECKED = "2026-09-02"
+_CHECKED = "2026-09-07"
 
 # Model ids frequently carry a release-date suffix (claude-haiku-4-5-20251001,
 # gpt-4o-2024-08-06). Stripping exactly that suffix is safe; anything looser would let a
@@ -163,7 +164,10 @@ def _gemini(
     )
 
 
-_PROMO = "promotional input rate, published as running through 2026-12-31"
+_PROMO = (
+    "promotional input, output and cache-read rates, published as running through "
+    "2026-12-31; all three double on 2027-01-01"
+)
 
 # Prompt-length thresholds above which the published rates change.
 _OPENAI_TIER = 272_000
@@ -190,8 +194,11 @@ PRICES: dict[str, ModelPrice] = {
     "claude-haiku-4-5": _anthropic(1.0, 5.0, 1.25, 0.10),
     "claude-haiku-3-5": _anthropic(0.80, 4.0, 1.0, 0.08),
     # --- OpenAI: input, cached input, output ---
-    # GPT-5.6 and later charge 1.25x input for cache writes and shift to a higher tier
-    # above 272k prompt tokens; earlier models do neither.
+    # Two independent things, easy to conflate. Cache writes: GPT-5.6 and later charge
+    # 1.25x input, earlier models carry no additional cache-write charge. The 272k
+    # long-context tier is separate and applies to every model below, including gpt-5.5
+    # and gpt-5.4 — they publish it in the row label rather than as extra columns, which
+    # is why it was missed here until the 2026-09-07 sweep.
     "gpt-5.6-sol": _openai(
         4.0,
         0.40,
@@ -213,13 +220,26 @@ PRICES: dict[str, ModelPrice] = {
         cache_write_multiplier=1.25,
         max_priced_prompt_tokens=_OPENAI_TIER,
     ),
-    "gpt-5.5": _openai(5.0, 0.50, 30.0, cache_write_multiplier=1.0),
-    "gpt-5.4": _openai(2.50, 0.25, 15.0, cache_write_multiplier=1.0),
+    "gpt-5.5": _openai(
+        5.0,
+        0.50,
+        30.0,
+        cache_write_multiplier=1.0,
+        max_priced_prompt_tokens=_OPENAI_TIER,
+    ),
+    "gpt-5.4": _openai(
+        2.50,
+        0.25,
+        15.0,
+        cache_write_multiplier=1.0,
+        max_priced_prompt_tokens=_OPENAI_TIER,
+    ),
     "gpt-4o": _openai(2.50, 1.25, 10.0, cache_write_multiplier=1.0),
     "gpt-4o-mini": _openai(0.15, 0.075, 0.60, cache_write_multiplier=1.0),
     "o1": _openai(15.0, 7.50, 60.0, cache_write_multiplier=1.0),
     "gpt-3.5-turbo": _openai(0.50, None, 1.50, cache_write_multiplier=1.0),
     # --- Google Gemini: input, output, cache read ---
+    "gemini-3.8-flash": _gemini(0.75, 3.75, 0.075, _PROMO),
     "gemini-3.7-flash": _gemini(0.75, 3.75, 0.075, _PROMO),
     "gemini-3.6-flash": _gemini(0.75, 3.75, 0.075, _PROMO),
     "gemini-3.5-flash": _gemini(1.50, 9.0, 0.15),
@@ -229,7 +249,8 @@ PRICES: dict[str, ModelPrice] = {
         1.25,
         10.0,
         0.125,
-        "rates for prompts up to 200k tokens; above that input is $2.50 and cache read $0.25",
+        "rates for prompts up to 200k tokens; above that input is $2.50, output $15 "
+        "and cache read $0.25",
         max_priced_prompt_tokens=_GEMINI_PRO_TIER,
     ),
 }

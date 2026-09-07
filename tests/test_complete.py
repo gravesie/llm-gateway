@@ -54,7 +54,11 @@ class TestHappyPath:
         assert row["timestamp"].endswith("+00:00")
         assert row["response_id"] == "chatcmpl-test-1"
         assert row["pricing_source"] == "gateway_table"
-        assert row["pricing_checked"] == "2026-09-02"
+        # Against the constant, not a literal: what this asserts is that the record
+        # carries the table's own check date through, and a literal here just means a
+        # second file to edit on every price sweep. Provenance itself is covered by
+        # test_pricing.py::TestProvenance.
+        assert row["pricing_checked"] == pricing._CHECKED
         assert row["fx_rate_usd_per_gbp"] == 1.3555
 
     def test_arguments_reach_litellm_untouched(
