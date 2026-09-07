@@ -154,9 +154,27 @@ git branch -d <branch>
 git push origin --delete <branch>
 ```
 
-Neither branch is deleted for you, so both of those last two are needed. `git branch -d` warns
-that the branch is "not yet merged to HEAD" and then deletes it anyway — that is the squash
-merge, since the commit on `main` is not the commit on the branch. It is not a reason to reach
-for `-D`. `git worktree remove` does not need `--force`; the gitignored venv does not block it.
+Neither branch is deleted for you, so both of those last two are needed. `git worktree remove`
+does not need `--force`; the gitignored venv does not block it.
 
-Observed 2026-09-06 on PR #10, which is also the PR that wrote this section.
+**`git branch -d` after a squash merge goes one of two ways, and which one depends on whether
+the remote tracking ref still exists.** `-d` deletes a branch that is fully merged into *its
+upstream*, or into *HEAD* when no upstream is set. A squash merge never satisfies the HEAD
+test — the commit on `main` is a different commit from the one on the branch — so:
+
+- **Tracking ref still there** (the worktree case above, where `--delete-branch` half-failed
+  and so never removed the remote branch): the local tip still equals `origin/<branch>`, the
+  upstream test passes, and git deletes it while warning that it is "not yet merged to HEAD".
+  That warning is the squash merge and is not a reason to reach for `-D`.
+- **Tracking ref gone** (`--delete-branch` succeeded, or you have since run `git fetch
+  --prune`): there is no upstream left to test against, git falls back to HEAD, and it
+  **refuses** with "not fully merged", hinting at `-D`.
+
+In the second case `-D` is correct, but confirm the content actually landed before forcing
+anything — `git diff <branch> origin/main -- <the files>` should come back empty. Do not reach
+for `-D` on the strength of the hint alone.
+
+Observed 2026-09-06 on PR #10 (first case, from a worktree) and 2026-09-07 on PR #12 (second
+case, from the primary checkout). PR #10 wrote this section and recorded only the behaviour it
+happened to hit. Both cases were then reproduced deterministically with synthetic refs, so the
+rule above is tested rather than inferred from two anecdotes.
