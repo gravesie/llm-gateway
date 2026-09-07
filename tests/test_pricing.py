@@ -30,6 +30,21 @@ class TestModelResolution:
         assert lookup.priced_as == "claude-opus-5"
         assert lookup.provider == "anthropic"
 
+    def test_gemini_3_8_flash_is_priced_from_the_table_not_the_litellm_fallback(self):
+        """Added by the 2026-09-07 sweep; it launched after the previous one.
+
+        litellm already knew it, so it priced before this entry existed — but through the
+        fallback, which carries ``checked=None`` and a "not independently verified" note.
+        The assertion that matters is the source, not the rates: a model quietly priced
+        from litellm's catalogue is the shape a stale table takes before anyone notices.
+        """
+        lookup = pricing.look_up_price("gemini-3.8-flash")
+        assert lookup.source == "gateway_table"
+        assert lookup.price.checked == pricing._CHECKED
+        assert lookup.price.input_usd_per_mtok == 0.75
+        assert lookup.price.output_usd_per_mtok == 3.75
+        assert lookup.price.cache_read_usd_per_mtok == 0.075
+
     def test_unknown_model_resolves_to_no_price(self):
         lookup = pricing.look_up_price("not-a-real-model-9000")
         assert lookup.source == "unknown"
@@ -146,12 +161,51 @@ class TestLongContextTiers:
         assert price.max_priced_prompt_tokens is None
         assert not pricing.long_context_tier_exceeded(price, 900_000)
 
+    @pytest.mark.parametrize(
+        "model",
+        ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4"],
+    )
+    def test_every_openai_model_with_a_published_long_tier_carries_it(self, model):
+        """gpt-5.5 and gpt-5.4 shipped without this and were billed at the low tier.
+
+        OpenAI publishes the 272k threshold two different ways — extra columns on the
+        GPT-5.6 rows, a ``(<272K context length)`` suffix in the row label on gpt-5.5 and
+        gpt-5.4 — and the second form was read as "no tier". Above the threshold both of
+        those models roughly double on input, so the miss understated the bill rather than
+        overstating it. Parametrised over the whole family so a newly added sibling has to
+        make a deliberate choice rather than inheriting the default.
+        """
+        price = pricing.PRICES[model]
+        assert price.max_priced_prompt_tokens == pricing._OPENAI_TIER
+        assert not pricing.long_context_tier_exceeded(price, pricing._OPENAI_TIER)
+        assert pricing.long_context_tier_exceeded(price, pricing._OPENAI_TIER + 1)
+
+    @pytest.mark.parametrize("model", ["gpt-5.5", "gpt-5.4"])
+    def test_a_long_prompt_on_the_older_gpt5_models_is_unpriced_not_cheap(self, model):
+        """The tier must make a long prompt refuse to price, not price at the low rate.
+
+        ``long_context_tier_exceeded`` is only half the guard: it is worth nothing unless
+        the low-tier rates are still what the table carries, so the caller has something
+        to reject. Asserting both together is what makes this test fail if someone
+        "fixes" the miss by writing the *high* rates in instead.
+        """
+        price = pricing.PRICES[model]
+        below = pricing.cost_usd(
+            price,
+            input_tokens=1_000_000,
+            output_tokens=0,
+            cache_read_tokens=0,
+            cache_write_tokens=0,
+        )
+        assert below == pytest.approx(price.input_usd_per_mtok)
+        assert pricing.long_context_tier_exceeded(price, 272_001)
+
 
 class TestProvenance:
     def test_every_rate_carries_a_source_and_a_date(self):
         for name, price in pricing.PRICES.items():
             assert price.source_url.startswith("https://"), name
-            assert price.checked == "2026-09-02", name
+            assert price.checked == "2026-09-07", name
 
     def test_the_table_agrees_with_litellms_independent_catalogue(self):
         """Cross-check against a second source to catch transcription errors.

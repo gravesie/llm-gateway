@@ -27,7 +27,9 @@ __all__ = [
 ENV_VAR = "LLM_GATEWAY_USD_GBP_RATE"
 
 # US dollars per pound sterling. Federal Reserve H.10 release, rate for 2026-08-28,
-# read 2026-09-02. Override with LLM_GATEWAY_USD_GBP_RATE rather than editing this.
+# re-read 2026-09-07 and still the latest published figure — the release carrying it is
+# dated 2026-08-31, so the rate date below is correct and is not the same thing as the
+# date this was checked. Override with LLM_GATEWAY_USD_GBP_RATE rather than editing this.
 DEFAULT_USD_PER_GBP = 1.3555
 DEFAULT_SOURCE_URL = "https://www.federalreserve.gov/releases/h10/current/"
 DEFAULT_RATE_DATE = "2026-08-28"
