@@ -1,6 +1,6 @@
 # llm-gateway
 
-In-process LLM routing, fallback and cost instrumentation for PGGI projects.
+In-process LLM routing, fallback and cost instrumentation for Goyande projects.
 
 A Python library, imported by the applications that spend the money. No server, no
 database, nothing deployed. See `DEPLOY.md` for why, and `docs/decisions.md` for the
