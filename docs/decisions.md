@@ -648,3 +648,95 @@ ceiling will actually read them.
 was read off `completion.py` — `budget.enforce()`, then `litellm.completion()`, then the
 record write — and the lock's scope off `budget.evaluate()`, rather than restated from
 memory. Suite: 249 tests, ruff clean.
+
+---
+
+## 2026-09-07 — What the first real integration taught
+
+web-auditor integrated `judge()` on 2026-09-06 (its PR #409, merged and deployed). It shipped
+dark behind an operator switch that defaults to the direct Anthropic call, so no traffic moves
+until someone turns it on. The 2026-09-05 spike predicted the shape of this correctly and
+missed four things. They are recorded here because the spike entry reads as settled and is
+now incomplete.
+
+**litellm's exceptions are not `anthropic.AnthropicError` subclasses.** They derive from
+`openai.OpenAIError` — verified against litellm 1.100.0, not restated from the taxonomy in
+the 2026-09-02 entry, which describes litellm's internal hierarchy and never says this. It is
+what a consumer trips over first. web-auditor's `judge()` had one `except
+anthropic.AnthropicError` covering its provider call; on the gateway path that catches
+nothing, so an error which previously degraded one audit check would instead propagate out
+and break it. Worse, that consumer's "is this a billing failure worth alerting on" test was
+keyed on Anthropic's exception classes, so it would have stopped firing on the day the switch
+went on — silently, because the alert not firing looks exactly like nothing being wrong.
+**Any consumer moving an existing path onto `complete()` must widen its exception handling
+before the switch, not after.**
+
+**A consumer catching `GatewayError` swallows a misconfiguration as if it were a spend
+decision.** `BudgetExceeded` and `BudgetMisconfigured` share that base class deliberately —
+the distinction it draws, "the gateway declined to spend this" versus "the provider failed",
+is the useful one for the common case. But the two are not interchangeable.
+`BudgetMisconfigured` means a ceiling cannot be enforced as configured — set but unparseable,
+or set without `LLM_GATEWAY_COST_LOG` — and it refuses **every** call until a human fixes an
+environment variable. The first integration caught the base class and suppressed its billing
+alert for the whole family, on the reasoning that a refusal is a decision rather than an
+outage. That reasoning is right for one subclass and wrong for the other, and the failure it
+produces is the quiet kind: every request degrading behind a log line, no alert, and the
+operator switch still reading as healthy.
+
+**Fixed in documentation, not in the hierarchy.** Splitting `BudgetMisconfigured` out from
+`GatewayError` would break the distinction that makes the base class worth having, to protect
+against one misreading of it. The README now tells a caller to catch the two separately and
+says why. **Rules out:** reparenting `BudgetMisconfigured`, and adding a third exception
+family for operator faults.
+
+**`import litellm` costs ~10.5s, and this library deferring it is now load-bearing rather
+than tidy.** `import llm_gateway` is ~0.08s because `complete()` does that import itself. A
+consumer can therefore import this library at module scope without paying for litellm on a
+web boot, a worker boot or a test session — but the first real call in each process pays all
+of it. **A caller's `timeout` bounds the provider call and not that import**, so the first
+gateway call in a fresh process is ~10.5s slower than the steady state and no timeout will
+say so. Worth knowing before wiring `complete()` into a request path.
+
+**litellm 1.100.0 recognises this consumer's model ids.** `claude-haiku-4-5`,
+`claude-sonnet-5` and `claude-opus-4-8` all route to anthropic and all have prices. The
+null-provider attribution hole — the reason there is no per-provider ceiling, recorded
+2026-09-05 — does not bite web-auditor. It is still a real hole for an unrecognised model id;
+it is not one this consumer stands in.
+
+**This repository is public as of 2026-09-06, and that was forced rather than chosen.** A
+`git+https` dependency on a private repository fails in a consumer's CI (`pip install -e
+".[dev]"`) and again in its Docker build on the VPS, because neither holds credentials for a
+second private repo. The alternatives — a deploy key in two more places, or vendoring the
+source — were both worse. Scanned before flipping: no keys, no customer data, nothing but the
+author's own commit address. **Consequence for this file: it is a public document.** Consumer
+names, hosting providers and internal reasoning in it are readable by anyone.
+
+**Supersedes the moto SEO pipeline as a consumer, everywhere it appears above.** The
+2026-09-02 entry leaves open "the moto SEO pipeline's Python version has not been checked",
+and the 2026-09-05 per-workload entry motivates workload ceilings with moto and web-auditor
+sharing one pot. Both were written in good faith and both are void: the only moto codebase is
+a product scraper with no LLM dependency, no packaging and no git. The Python-version
+question is not answered, it is moot. The case for per-workload ceilings does not depend on
+it — one consumer with several workloads under one global pot makes the same argument, which
+is exactly what web-auditor is, labelling every call `web-auditor:<purpose>`. The README's
+worked examples have been changed to match; the dated entries above are left as written.
+
+**`_FALLBACK_RATE` stays unreconciled, deliberately** (Pete's call, 2026-09-06). web-auditor
+prices an unknown model at the Opus rate; this library returns null and never estimates.
+Those fail in opposite directions — overstating trips that consumer's own gate early, nulling
+lets spend run past a ceiling here — so they are not one number measured twice and averaging
+them would mean nothing. **Rules out:** converting either convention to the other during a
+future integration. It changes what that codebase's budget means, and the argument is written
+beside the constant in its source.
+
+**Accepted losses:** a consumer must widen its exception handling and read the
+`BudgetExceeded`/`BudgetMisconfigured` distinction before switching a path over, and neither
+is discoverable from the type signature alone. The ~10.5s first-call cost is unavoidable
+while litellm is the provider layer.
+
+**Evidence:** no library change, so nothing to mutation-test — every finding above was read
+off installed source or observed in the consumer's integration rather than recalled. The
+exception hierarchy was checked against litellm 1.100.0; the import cost measured in a
+subprocess, because by the time a suite runs something else has usually imported litellm
+already and an in-process measurement passes for the wrong reason. Suite: 249 tests, ruff
+clean, v0.5.0 and schema 3 unchanged.
