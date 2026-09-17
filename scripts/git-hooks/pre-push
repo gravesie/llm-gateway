@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 #
 # Pre-push gate: nothing reaches GitHub without passing lint and the full test suite,
-# so an unpushed-and-broken state can't sit around as the running test site.
+# so an unpushed-and-broken state can't sit around as the running test site. Also runs
+# the two standing process checks (environment, context budget) before either of those,
+# so a size- or encoding-based gate never disagrees between this machine and CI.
 #
 # Runs on every `git push`. To skip in a genuine emergency:  SKIP_PREPUSH=1 git push
 # A skip must be reported in the session, never used quietly.
@@ -25,6 +27,22 @@ cd "$(git rev-parse --show-toplevel)"
 if   [ -x ".venv/Scripts/python.exe" ]; then PY=".venv/Scripts/python.exe"
 elif [ -x ".venv/bin/python" ];        then PY=".venv/bin/python"
 else PY="python"
+fi
+
+# Before the budget, because it validates the budget check's own input: if the working
+# tree has drifted from the index, check_context_budget.py measures a different file
+# locally than CI measures, and the same committed max_bytes means two different things
+# on the two sides.
+echo "pre-push: environment"
+if ! "${PY}" scripts/check_environment.py; then
+  echo "pre-push: environment check failed. Fix it, or SKIP_PREPUSH=1 to override." >&2
+  exit 1
+fi
+
+echo "pre-push: context budget"
+if ! "${PY}" scripts/check_context_budget.py; then
+  echo "pre-push: context budget exceeded. Fix it, or SKIP_PREPUSH=1 to override." >&2
+  exit 1
 fi
 
 echo "pre-push: lint"

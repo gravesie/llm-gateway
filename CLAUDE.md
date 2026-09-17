@@ -42,8 +42,35 @@ on a case-by-case judgement about what counts as important. Follow it literally.
 - Changing CI/CD configuration.
 - Reading or rotating a secret.
 
-The last five are also enforced by a PreToolUse hook (`.claude/hooks/guard_ship.py`),
-so they prompt even under an auto-accept permission mode.
+`.claude/hooks/guard_ship.py`, a PreToolUse hook, watches for the git and production
+items above — merging, pushing to a protected branch, force-pushing, writing history onto
+a protected branch (`commit`, `merge`, `cherry-pick`, `revert`, `rebase`, `pull`) or
+force-moving one (`branch -f`/`-M`, `checkout -B`, `switch -C`), `update-ref` on any
+branch, the history writers plus `reset`, `checkout`/`switch`, `restore`, `stash` and
+`clean` in someone else's primary checkout, running the deploy script by hand, and SSH to
+production. It resolves the repo the command actually targets, so a `cd` or `git -C` into
+another project is covered too; when the shell decides the target (an unknown variable,
+`$(…)`), it asks. It also covers the GitHub MCP equivalents by tool name —
+`merge_pull_request` always, and `push_files`/`create_or_update_file`/`delete_file` when
+the target branch is `main` or absent — which is why its `settings.json` matcher names
+those tools alongside `Bash`. Change the two together; a tool the matcher omits never
+invokes the hook at all. Not covered: `reset` on your own protected branch (the routine
+sync), deleting a branch, `add`/`rm`/`mv`/`apply` in another checkout, and any merge path
+that is neither a shell command nor one of those four MCP tools — your client may have
+its own. **It warns, it does not block**: measured,
+it fires and names the repo, branch and reason as a visible message in both auto-accept
+and manual permission modes, but in an auto-accept permission mode the action proceeds
+regardless of the `ask` it returns. Treat its message as a cue to stop yourself, not as
+something that stops for you. Changing CI config and handling secrets are on you to stop
+for; no hook can recognise them from a command line.
+
+`.claude/hooks/stop_gate.py`, a Stop hook, checks two turn-level invariants at the end of
+every turn: the work is on a branch rather than on `main`, and the branch's first commit
+is the plan, on its own, before any code (matching `docs/*plan*.md`, or carrying a
+`Plan-exempt: <reason>` trailer). Those are the two things that make an unwatched session
+recoverable — if it dies, `main` is clean and the intent is in git. It blocks exactly once
+per stop-chain and then lets the turn end, so it is one recorded nudge, not a wall. It
+does not judge whether the code is correct; nothing deterministic can.
 
 ## Concurrent sessions
 

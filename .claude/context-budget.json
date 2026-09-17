@@ -1,0 +1,24 @@
+{
+  "_comment": [
+    "Size ceilings for files that are loaded into the model's context eagerly — before the",
+    "session does anything, and re-sent on every turn. Checked by",
+    "scripts/check_context_budget.py from the pre-push hook and from CI.",
+    "",
+    "Only budget files that are actually loaded that way. CLAUDE.md is. DEPLOY.md is not:",
+    "it is read on demand, when someone is about to release, not on every turn.",
+    "",
+    "CLAUDE.md measured 11,974 bytes when this file was written (A17). The cap sits far",
+    "enough above that for the WARN band (90% of the cap, 12,600 bytes) to be a useful",
+    "nudge rather than something that fires on arrival.",
+    "",
+    "The number is a ratchet. Lower it when the file shrinks; raising it needs a commit",
+    "message saying why."
+  ],
+  "budgets": [
+    {
+      "path": "CLAUDE.md",
+      "max_bytes": 14000,
+      "note": "Rules and reference that must hold in every session. Anything that is a record rather than a rule belongs in docs/ and is read on demand."
+    }
+  ]
+}
