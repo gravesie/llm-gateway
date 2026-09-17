@@ -39,6 +39,29 @@ jobs:
       - name: Test
         run: python -m pytest
 
+  # The two standing process checks, kept as their own job rather than as steps in
+  # `test`: they need no dependency install, and keeping them separate means a red
+  # process check is distinguishable at a glance from a failing lint/test run. A
+  # standalone checks.yml would be the other option, and is what repos with no CI at
+  # all got; this repo already has a workflow, so a second file would just be noise.
+  checks:
+    name: checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      # Before the budget, because it validates the budget check's own input:
+      # line-ending drift makes the local and CI measurements of the same file disagree.
+      - name: Environment check
+        run: python scripts/check_environment.py
+
+      - name: Context budget
+        run: python scripts/check_context_budget.py
+
   release:
     name: Build and publish release
     needs: test
