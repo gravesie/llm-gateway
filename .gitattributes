@@ -1,5 +1,49 @@
-# Shell scripts and hooks must keep LF endings so they run on Linux — both in CI and in
-# any cloud session that checks this repo out.
-*.sh text eol=lf
-*.py text eol=lf
-scripts/git-hooks/* text eol=lf
+# Every text file is LF in the index and LF in the working tree.
+#
+# Copy this into the project root unchanged, then add project-specific binary types at
+# the bottom. Do not narrow the catch-all to a list of extensions: the failure this
+# prevents is precisely the file type nobody thought to name.
+#
+# What goes wrong without it. On Windows, `core.autocrlf=true` is commonly set in the
+# *system* gitconfig, so it applies to every repo on the machine and does not show up in
+# any repo's own config. Git then checks text files out as CRLF while the index keeps
+# LF. Two consequences that both look like something else:
+#
+#   1. `scripts/check_context_budget.py` measures bytes on disk, which is correct. With
+#      a CRLF working copy it reads one byte per line more than CI reads from the LF
+#      blob, so the same committed `max_bytes` means two different things on the two
+#      sides of the gate, and the local check fails before CI would. Measured on
+#      web-auditor: a ~400-byte gap on a 398-line CLAUDE.md.
+#   2. A shell script or git hook checked out CRLF fails on Linux with an error that
+#      names neither line endings nor the real cause.
+#
+# `scripts/check_environment.py` enforces the result of this file on every push.
+
+* text=auto eol=lf
+
+# Binary formats must never be line-ending converted or diffed as text. Extend for the
+# project - archives, media, model weights, compiled artefacts, lockfiles that are not
+# text.
+*.png   -text
+*.jpg   -text
+*.jpeg  -text
+*.gif   -text
+*.webp  -text
+*.ico   -text
+*.pdf   -text
+*.zip   -text
+*.gz    -text
+*.tar   -text
+*.woff  -text
+*.woff2 -text
+*.ttf   -text
+*.otf   -text
+*.pyc   -text
+
+# Office documents are zip containers. `text=auto` detects them as binary, but
+# saying so explicitly costs nothing and survives someone narrowing the catch-all.
+*.docx  -text
+*.xlsx  -text
+*.pptx  -text
+*.so    -text
+*.dll   -text
