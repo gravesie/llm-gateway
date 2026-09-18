@@ -57,6 +57,16 @@ one unit is not an error, only a narrower claim -- that unit is shown as not re-
 this session rather than folded silently into "still open." This is a deliberate
 narrowing of this hook's older claim to be unable to fail meaningfully -- true when this
 file only printed a fixed string, and not true the moment it reads external state.
+
+A25: STALENESS. The queue and distribution sections re-verify their own narrow claims (a
+unit's PR state, an adopter's blob) against GitHub, but neither says anything if the
+checkout THEY are reading from is itself behind `origin/main` -- measured 2026-09-13 (A24):
+a session opened with a six-unit queue listing while origin already held seven, because the
+checkout was a merge behind and nothing had fetched since. `commits_behind_origin` fetches
+`origin/main` and compares it to `HEAD` before either of those sections renders, printing a
+warning naming how many commits behind the checkout is. Silence here (no `origin`, offline,
+`git` missing) is the common case, not a warning on its own -- only "checked and found
+behind" is.
 """
 
 from __future__ import annotations
@@ -191,6 +201,70 @@ def _branch_line(repo_root: str | None) -> str:
         "or concurrent session. Do not add commits onto it for a new work unit; branch "
         "off `main` instead (in a separate `git worktree` if another session might "
         "still be using this checkout)."
+    )
+
+
+# ---------------------------------------------------------------------- staleness
+
+
+def commits_behind_origin(repo_root: str) -> int | None:
+    """How many commits `origin/main` has that HEAD lacks, or None if this could not be
+    determined -- no `origin` remote, offline, `git` missing, or a timeout. None is the
+    common case for a throwaway or air-gapped checkout, not an error.
+
+    Fetches `origin/main` first so the comparison is live rather than however stale the
+    last fetch (this session's, another session's, or an IDE's) happened to leave the
+    local remote-tracking ref -- the exact gap A24 hit (2026-09-13): a checkout can sit
+    behind origin for as long as nothing else happens to fetch it, and the queue/
+    distribution sections below have no way to know that on their own. A fetch only
+    updates `refs/remotes/origin/main` and `FETCH_HEAD` inside `.git` -- it does not touch
+    the working tree or any tracked file, so it does not conflict with this file's "does
+    not write to the repo" claim above, which is about tracked/working-tree state.
+
+    The fetch's own exit code is not checked before running `rev-list`: if the fetch
+    fails, `rev-list` still runs against whatever `origin/main` was already cached, which
+    is strictly better than reporting nothing at all.
+
+    Isolated to one call site -- same reason as `gh_pr_view` -- so a self-test can
+    replace exactly this function without depending on a real network fetch.
+    """
+    try:
+        subprocess.run(
+            ["git", "-C", repo_root, "fetch", "origin", "main", "--quiet"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=GH_TIMEOUT_SECONDS,
+        )
+        proc = subprocess.run(
+            ["git", "-C", repo_root, "rev-list", "--count", "HEAD..origin/main"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=GH_TIMEOUT_SECONDS,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None
+    out = (proc.stdout or "").strip()
+    if proc.returncode != 0 or not out.isdigit():
+        return None
+    return int(out)
+
+
+def render_staleness_section(repo_root: str) -> str:
+    """'' when the checkout is current with `origin/main` or this cannot be determined
+    (no origin remote, offline, git missing -- not itself a problem), one line when it is
+    behind. Never raises."""
+    behind = commits_behind_origin(repo_root)
+    if not behind:
+        return ""
+    plural = "s" if behind != 1 else ""
+    return (
+        f"\n\nSTALENESS WARNING: this checkout is {behind} commit{plural} behind "
+        "origin/main. The queue and distribution sections below may be stale -- "
+        "`git pull` before trusting them."
     )
 
 
@@ -425,6 +499,7 @@ def evaluate() -> dict:
     context = _opening_checks(repo_root)
 
     if repo_root:
+        context += render_staleness_section(repo_root)
         context += render_queue_section(repo_root)
         context += render_distribution_section(repo_root)
 

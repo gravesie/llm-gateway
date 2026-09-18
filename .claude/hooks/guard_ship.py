@@ -22,14 +22,18 @@ THREE KINDS OF CHECK LIVE HERE.
     fire regardless of which repo the command targets, which is exactly what is wanted
     for `gh pr merge`, a force-push, `deploy.sh` and an SSH to production.
 
-  * MCP tool calls (MCP_MERGE_TOOLS, MCP_MAIN_WRITE_TOOLS). The same guarded actions
-    reached through the GitHub MCP server instead of a shell: a merge, and the file
-    writes that can target a protected branch with no PR at all. Matched on tool_name
-    and the branch in tool_input, not on any command string -- there is no command
-    string. Ported from web-auditor#224, which exists because web-auditor PR #185 was
-    merged through `mcp__github__merge_pull_request` on 2026-07-28 and this hook, then
-    registered only against `Bash`, never fired. settings.json's PreToolUse matcher
-    names these tools explicitly alongside `Bash`; the two have to be changed together.
+  * MCP tool calls (MCP_MERGE_TOOLS, MCP_MAIN_WRITE_TOOLS, MCP_AUTO_MERGE_TOOLS). The
+    same guarded actions reached through an MCP server instead of a shell: a merge, the
+    file writes that can target a protected branch with no PR at all, and enabling
+    auto-merge on the desktop app's own merge path. Matched on tool_name and (for the
+    latter two) a field in tool_input, not on any command string -- there is no command
+    string. The first two are ported from web-auditor#224, which exists because
+    web-auditor PR #185 was merged through `mcp__github__merge_pull_request` on
+    2026-07-28 and this hook, then registered only against `Bash`, never fired.
+    MCP_AUTO_MERGE_TOOLS (A18) closes the same shape of hole for `mcp__ccd_pr__set_auto_merge`,
+    found by grep rather than by an incident: this repo's own canonical copy had never
+    named it. settings.json's PreToolUse matcher names all of these tools explicitly
+    alongside `Bash`; the two have to be changed together.
 
   * Repo-state checks (REPO_CHECKS). These resolve *which repository the command will
     actually run in* -- from a `git -C <path>`, from a `cd <path> &&` earlier in the same
@@ -277,6 +281,38 @@ def _mcp_main_write_reason(tool_input: dict) -> str | None:
     if branch is None or branch == "main":
         return MCP_MAIN_WRITE_REASON
     return None
+
+
+# A18: the desktop app's own merge path. Found 2026-09-12 while doing #56 -- canonical
+# guard_ship.py had no reference to this tool at all, so it was guarded by NO copy of the
+# hook anywhere, and it is the client Pete actually merges from, unlike the two arms
+# above, which are ports of a GitHub MCP server that is not even configured on this
+# machine. Verifiable directly, the same way #224's `merge_pull_request` name is not: the
+# tool is present in this client's own tool list.
+#
+# Guarded on `enabled`, not unconditionally like MCP_MERGE_TOOLS, and not by branch like
+# MCP_MAIN_WRITE_TOOLS: the tool's own description says enabling "lands code without
+# another look", but disabling "also leaves a merge queue" -- it is not itself
+# irreversible, so asking on it would be a guard that cries wolf on a safe call, the exact
+# failure MCP_MAIN_WRITE_TOOLS's prefix-match note above warns against. `enabled` absent
+# is treated the same as `True`: the tool's own schema always includes it in practice, so
+# an absent key means the payload is not the shape this guard expects, and it asks rather
+# than assuming the call is a safe disable -- same posture as `_mcp_main_write_reason`'s
+# absent `branch`.
+MCP_AUTO_MERGE_TOOLS = frozenset({"mcp__ccd_pr__set_auto_merge"})
+MCP_AUTO_MERGE_REASON = (
+    "This enables auto-merge on the bound pull request, the desktop app's own merge "
+    "path -- the PR lands as soon as checks pass, with no further look. Merging to main "
+    "deploys to production. This needs an explicit go from Pete in this session -- a "
+    "green test suite on its own is not authorisation."
+)
+
+
+def _mcp_auto_merge_reason(tool_input: dict) -> str | None:
+    """Reason for set_auto_merge, or None when it is disabling auto-merge."""
+    if tool_input.get("enabled") is False:
+        return None
+    return MCP_AUTO_MERGE_REASON
 
 
 # ----------------------------------------------------------------------- paths
@@ -1158,6 +1194,9 @@ def evaluate(payload: dict) -> dict | None:
     if tool_name in MCP_MAIN_WRITE_TOOLS:
         reason = _mcp_main_write_reason(payload.get("tool_input") or {})
         return _ask(reason) if reason else None
+    if tool_name in MCP_AUTO_MERGE_TOOLS:
+        reason = _mcp_auto_merge_reason(payload.get("tool_input") or {})
+        return _ask(reason) if reason else None
 
     if tool_name != "Bash":
         return None
@@ -1203,6 +1242,7 @@ CRASH_RECHECK_WORDS = (
     "ssh",
     "deploy.sh",
     "mcp__github__",
+    "mcp__ccd_pr__",
 )
 
 
