@@ -126,6 +126,20 @@ def extract_usage(response: Any) -> dict[str, int]:
     }
 
 
+def call_endpoint(kwargs: dict[str, Any]) -> str | None:
+    """The base URL a call is sent to, if the caller set one.
+
+    litellm takes it as ``api_base`` or ``base_url`` and prefers ``api_base`` when both are
+    given (``litellm.completion``: ``kwargs.get("api_base") or base_url``). Reading only one
+    of them would let the other route a call to a custom endpoint unnoticed.
+    """
+    for key in ("api_base", "base_url"):
+        value = kwargs.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
 def unpriced_modifier(kwargs: dict[str, Any], response: Any) -> str | None:
     """Name the first pricing modifier in play that this version does not model.
 
@@ -177,9 +191,12 @@ def _build_record(
     rate, fx_source = fx.resolve_rate()
 
     # Price against what the caller asked for; if that is unknown, try what actually ran.
-    lookup = pricing.look_up_price(requested_model)
+    # Both at the endpoint the call was sent to: a custom api_base is priced by its host,
+    # never by the model name, which says nothing reliable about who is billing.
+    endpoint = call_endpoint(kwargs)
+    lookup = pricing.look_up_price(requested_model, api_base=endpoint)
     if lookup.price is None and resolved_model and resolved_model != requested_model:
-        lookup = pricing.look_up_price(resolved_model)
+        lookup = pricing.look_up_price(resolved_model, api_base=endpoint)
 
     measured = status == "ok" and not streaming
     reason: str | None = None
@@ -238,7 +255,10 @@ def _build_record(
         )
 
     tokens = extract_usage(response)
-    caveat = unpriced_modifier(kwargs, response)
+    # Checked first: when nobody knows who billed the call, no modifier matters.
+    caveat = "custom_endpoint_unpriced" if lookup.unknown_endpoint else None
+    if caveat is None:
+        caveat = unpriced_modifier(kwargs, response)
 
     if caveat is None:
         total_prompt = (
@@ -247,7 +267,11 @@ def _build_record(
         if pricing.long_context_tier_exceeded(lookup.price, total_prompt):
             caveat = "long_context_tier"
 
-    usd = None if caveat else pricing.cost_usd(lookup.price, **tokens)
+    usd, gbp = (
+        (None, None)
+        if caveat
+        else pricing.costs_usd_and_gbp(lookup.price, usd_per_gbp=rate, **tokens)
+    )
 
     response_id = _get(response, "id")
 
@@ -266,7 +290,7 @@ def _build_record(
         cache_write_tokens=tokens["cache_write_tokens"],
         latency_ms=latency,
         cost_usd=usd,
-        cost_gbp=fx.usd_to_gbp(usd, rate),
+        cost_gbp=gbp,
         pricing_source=lookup.source,
         pricing_checked=lookup.price.checked if lookup.price else None,
         pricing_caveat=caveat,

@@ -63,6 +63,39 @@ long enough to cross into a higher pricing tier. Streaming calls pass through un
 are recorded as `measured: false` — usage is not available until the stream is consumed.
 Each of those is countable in the log rather than silently missing.
 
+### Calls to a custom endpoint (relax.ai)
+
+A call given an `api_base` (or litellm's alias `base_url`) is priced by the endpoint's
+host, not by the model name. relax.ai is the one custom endpoint priced today:
+
+```python
+response = complete(
+    model="openai/DeepSeek-V4-Pro",   # litellm's route to an OpenAI-compatible API
+    api_base="https://api.relax.ai/v1",
+    api_key=relax_key,                # yours to load; the library never reads it
+    messages=[...],
+    workload="web-auditor:page-summary",
+)
+```
+
+- **relax.ai (`api.relax.ai`)** is recorded as `provider: "relax"` and priced only from its
+  own table, which is in pounds as relax.ai publishes it. `cost_gbp` is exact and `cost_usd`
+  is converted from it once, at the record's `fx_rate_usd_per_gbp`. The ceilings count it
+  like any other spend. A model relax.ai lists but this table does not is `null`, still
+  attributed to `relax`.
+- **Another vendor's own API** (`api.anthropic.com`, `api.openai.com`,
+  `generativelanguage.googleapis.com`) prices exactly as if no `api_base` had been given.
+- **Any other host** is recorded with the host as `provider`, `cost_usd: null` and
+  `pricing_caveat: "custom_endpoint_unpriced"`. Its models are never priced by name: relax.ai
+  sells `DeepSeek-V4-Pro`, and so does DeepSeek, at a different price and in a different
+  currency.
+
+`api_base` is a single argument, so every rung of a ladder goes to the same endpoint. A
+ladder cannot mix relax.ai with another provider. An endpoint set only through litellm's
+own configuration (`litellm.api_base`, or the `OPENAI_BASE_URL` / `OPENAI_API_BASE`
+environment variables) is invisible here and the call is priced by name; pass `api_base`
+explicitly.
+
 ## The monthly ceiling
 
 Set `LLM_GATEWAY_MONTHLY_BUDGET_GBP` to a number of pounds and a call is refused once
@@ -285,7 +318,7 @@ library is measurement-only for it today.
 ## Install
 
 ```
-pip install "llm-gateway @ git+https://github.com/gravesie/llm-gateway.git@v0.5.1"
+pip install "llm-gateway @ git+https://github.com/gravesie/llm-gateway.git@v0.6.0"
 ```
 
 Always a tag, never `main`. `DEPLOY.md` explains why.
