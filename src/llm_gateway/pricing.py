@@ -5,7 +5,14 @@ changes, and a rate with no provenance eventually produces a confident wrong num
 is worse than no number at all. When neither this table nor litellm knows a model, the cost
 is reported as ``None`` rather than guessed.
 
-Rates are per million tokens (MTok), in USD, matching how the providers publish them.
+Rates are per million tokens (MTok), in the currency the provider publishes them in:
+USD for everything in ``PRICES``, GBP for relax.ai. ``ModelPrice.currency`` says which.
+
+A call sent to a custom ``api_base`` is priced by the endpoint's host, never by the model
+name alone. relax.ai hosts open-weight models under names that other vendors also sell —
+``DeepSeek-V4-Pro`` is in litellm's catalogue at DeepSeek's own dollar rate — so a
+name-only lookup would bill a relax.ai call at somebody else's price and label it
+``openai``. See :func:`look_up_price`.
 
 What this module deliberately does not price:
 
@@ -26,13 +33,19 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from urllib.parse import urlsplit
+
+from . import fx
 
 __all__ = [
     "ModelPrice",
     "PriceLookup",
     "PRICES",
+    "RELAX_PRICES",
     "look_up_price",
     "cost_usd",
+    "cost_native",
+    "costs_usd_and_gbp",
     "long_context_tier_exceeded",
 ]
 
@@ -59,6 +72,15 @@ _LITELLM_SOURCE = (
 
 _CHECKED = "2026-09-07"
 
+# relax.ai publishes one table, in pounds sterling, with input and output rates only: no
+# cached-input or cache-write rate, and no prompt-length tier. The raw page was read on
+# ``_RELAX_CHECKED`` and the currency confirmed from its bytes (U+00A3), not from a
+# rendered summary. The page does not say whether VAT is included. litellm has no relax.ai
+# entries, so unlike the table above there is no second catalogue to cross-check against;
+# the model ids were confirmed against a live ``GET /v1/models`` the same day.
+_RELAX_SOURCE = "https://relax.ai/docs/getting-started/pricing"
+_RELAX_CHECKED = "2026-09-29"
+
 # Model ids frequently carry a release-date suffix (claude-haiku-4-5-20251001,
 # gpt-4o-2024-08-06). Stripping exactly that suffix is safe; anything looser would let a
 # future claude-opus-5-1 match claude-opus-5 and bill at the wrong rate.
@@ -67,7 +89,12 @@ _DATE_SUFFIX = re.compile(r"-(?:\d{8}|\d{4}-\d{2}-\d{2})$")
 
 @dataclass(frozen=True)
 class ModelPrice:
-    """Published rates for one model, in USD per million tokens.
+    """Published rates for one model, per million tokens, in ``currency``.
+
+    The ``_usd_`` in the rate field names predates non-dollar rates and is kept so existing
+    callers do not break. For a row whose ``currency`` is ``"GBP"`` those fields hold
+    pounds. Never multiply them by a token count and call the result dollars: use
+    :func:`costs_usd_and_gbp`, which reads ``currency`` and converts the right way round.
 
     A rate of ``None`` means "this provider does not publish a per-token charge for this
     category, or it is not known". It does not mean zero. Charging a non-zero token count
@@ -85,6 +112,9 @@ class ModelPrice:
     # exists, the rates above are the below-threshold rates and this is the ceiling they
     # hold to; a longer prompt is reported as unpriced rather than billed at the low tier.
     max_priced_prompt_tokens: int | None = None
+    # ISO 4217 code of the rates above. Only "USD" and "GBP" are understood; anything else
+    # prices to None rather than being converted at a guessed rate.
+    currency: str = "USD"
 
 
 @dataclass(frozen=True)
@@ -95,6 +125,9 @@ class PriceLookup:
     provider: str | None
     priced_as: str | None
     source: str  # "gateway_table" | "litellm" | "unknown"
+    # True when the call went to an ``api_base`` whose host this module does not know. No
+    # price is ever guessed for one; the caller records why the cost is null.
+    unknown_endpoint: bool = False
 
 
 def _anthropic(
@@ -161,6 +194,21 @@ def _gemini(
         checked=_CHECKED,
         note=note,
         max_priced_prompt_tokens=max_priced_prompt_tokens,
+    )
+
+
+def _relax(input_rate: float, output_rate: float) -> ModelPrice:
+    return ModelPrice(
+        input_usd_per_mtok=input_rate,
+        output_usd_per_mtok=output_rate,
+        # Not published. None rather than 0.0, so a cached-token count relax.ai starts
+        # reporting one day refuses to price instead of pricing as free.
+        cache_read_usd_per_mtok=None,
+        cache_write_usd_per_mtok=None,
+        source_url=_RELAX_SOURCE,
+        checked=_RELAX_CHECKED,
+        note="GBP rates as published; VAT treatment not stated on the page",
+        currency="GBP",
     )
 
 
@@ -255,6 +303,30 @@ PRICES: dict[str, ModelPrice] = {
     ),
 }
 
+# relax.ai, GBP per MTok: input, output. Keys are the ids relax.ai lists, lowercased. Only
+# ever consulted for a call whose ``api_base`` host is relax.ai's, never by name alone —
+# these ids are not unique to relax.ai. Mistral-7b-embedding is left out: embeddings do not
+# go through ``complete()``.
+RELAX_PRICES: dict[str, ModelPrice] = {
+    "deepseek-v4-pro": _relax(1.17, 2.33),
+    "deepseek-v41-flash": _relax(0.18, 0.72),
+    "nemotron-3-super": _relax(0.22, 0.67),
+    "muse-glimmer-30b": _relax(0.18, 0.66),
+}
+
+# Hosts an ``api_base`` may point at, and how a call sent there is priced.
+#
+# A host mapped to a table is a provider in its own right: the call is priced from that
+# table and nowhere else, and the record names that provider. A host mapped to ``None`` is
+# a first-party provider's own API, where passing ``api_base`` changes nothing about the
+# bill, so the ordinary lookup applies. Any host not listed is unknown and never priced.
+_ENDPOINTS: dict[str, tuple[str, dict[str, ModelPrice]] | None] = {
+    "api.relax.ai": ("relax", RELAX_PRICES),
+    "api.anthropic.com": None,
+    "api.openai.com": None,
+    "generativelanguage.googleapis.com": None,
+}
+
 
 def long_context_tier_exceeded(price: ModelPrice | None, total_prompt_tokens: int) -> bool:
     """Whether this call crossed into a pricing tier the table does not carry rates for."""
@@ -321,15 +393,67 @@ def _from_litellm(candidates: list[str]) -> tuple[ModelPrice, str] | None:
     return None
 
 
-def look_up_price(model: str | None) -> PriceLookup:
+def _endpoint_host(api_base: str) -> str | None:
+    """The host of an ``api_base``, or ``None`` if it does not parse to one.
+
+    ``SplitResult.hostname`` is already lowercased and has any port removed.
+    """
+    try:
+        host = urlsplit(api_base.strip()).hostname
+    except (AttributeError, ValueError):
+        return None
+    return host or None
+
+
+def _look_up_at_endpoint(model: str, api_base: str) -> PriceLookup | None:
+    """Price a call sent to ``api_base``, or ``None`` to fall through to the name lookup.
+
+    Falls through only for a first-party provider's own host. Every other outcome is final:
+    a known custom endpoint prices from its own table or not at all, and an unknown one is
+    never priced, because the model name says nothing reliable about who is billing.
+    """
+    host = _endpoint_host(api_base)
+    if host is not None and host in _ENDPOINTS:
+        endpoint = _ENDPOINTS[host]
+        if endpoint is None:
+            return None
+        provider, table = endpoint
+        # litellm needs a routing prefix ("openai/DeepSeek-V4-Pro") to reach an
+        # OpenAI-compatible endpoint. It says how to talk to the host, not who hosts the
+        # model, so it is dropped before the lookup.
+        bare = model.partition("/")[2] if "/" in model else model
+        bare = bare.strip().lower()
+        price = table.get(bare)
+        return PriceLookup(
+            price=price,
+            provider=provider,
+            priced_as=bare if price is not None else None,
+            source="gateway_table" if price is not None else "unknown",
+        )
+    return PriceLookup(
+        price=None,
+        provider=host,
+        priced_as=None,
+        source="unknown",
+        unknown_endpoint=True,
+    )
+
+
+def look_up_price(model: str | None, *, api_base: str | None = None) -> PriceLookup:
     """Resolve a model id to published rates.
 
-    Tries, in order: this module's table on the bare id, the same with a release-date
-    suffix stripped, then litellm's catalogue. Anything else resolves to no price, which
-    the caller records as a null cost.
+    With an ``api_base``, the endpoint's host decides first; see :func:`_look_up_at_endpoint`.
+    Otherwise, or for a first-party host, tries in order: this module's table on the bare
+    id, the same with a release-date suffix stripped, then litellm's catalogue. Anything
+    else resolves to no price, which the caller records as a null cost.
     """
     if not model or not isinstance(model, str):
         return PriceLookup(price=None, provider=None, priced_as=None, source="unknown")
+
+    if isinstance(api_base, str) and api_base.strip():
+        at_endpoint = _look_up_at_endpoint(model.strip(), api_base)
+        if at_endpoint is not None:
+            return at_endpoint
 
     bare, provider = _split_provider(model.strip())
     undated = _DATE_SUFFIX.sub("", bare)
@@ -362,9 +486,66 @@ def cost_usd(
 ) -> float | None:
     """Total USD for one call, or ``None`` when it cannot be computed honestly.
 
-    Returns ``None`` if there is no price at all, or if a token category has a non-zero
-    count but no published rate. Treating an unknown rate as zero would understate the
-    bill, and understating it silently is the one failure this library cannot afford.
+    Returns ``None`` if there is no price at all, if a token category has a non-zero count
+    but no published rate, or if the price is not in dollars — this function has no
+    exchange rate, and a pound figure returned as dollars is exactly the confident wrong
+    number this library exists to prevent. :func:`costs_usd_and_gbp` handles any currency.
+    """
+    if price is None or price.currency != "USD":
+        return None
+    return cost_native(
+        price,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_read_tokens=cache_read_tokens,
+        cache_write_tokens=cache_write_tokens,
+    )
+
+
+def costs_usd_and_gbp(
+    price: ModelPrice | None,
+    *,
+    usd_per_gbp: float,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int,
+    cache_write_tokens: int,
+) -> tuple[float | None, float | None]:
+    """``(cost_usd, cost_gbp)`` for one call, each ``None`` when it cannot be computed.
+
+    The figure in the price's own currency is exact; the other is converted once, at
+    ``usd_per_gbp``. A GBP rate is never converted to dollars and back again, which would
+    only return the published pounds figure if both conversions used the same rate.
+    """
+    native = cost_native(
+        price,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_read_tokens=cache_read_tokens,
+        cache_write_tokens=cache_write_tokens,
+    )
+    if native is None or price is None:
+        return None, None
+    if price.currency == "USD":
+        return native, fx.usd_to_gbp(native, usd_per_gbp)
+    if price.currency == "GBP":
+        return fx.gbp_to_usd(native, usd_per_gbp), native
+    return None, None
+
+
+def cost_native(
+    price: ModelPrice | None,
+    *,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int,
+    cache_write_tokens: int,
+) -> float | None:
+    """Total for one call in ``price.currency``, or ``None`` when it cannot be computed.
+
+    ``None`` if there is no price at all, or if a token category has a non-zero count but
+    no published rate. Treating an unknown rate as zero would understate the bill, and
+    understating it silently is the one failure this library cannot afford.
     """
     if price is None:
         return None

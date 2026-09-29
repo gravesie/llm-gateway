@@ -814,3 +814,77 @@ over 272k tokens on `gpt-5.5` or `gpt-5.4` now returns `cost_usd=None` with a ca
 previously returned a number — and a consumer that pinned `v0.5.0` should be able to see that
 in the tag rather than only in a diff. Schema does not move: no new field and no new `status`
 value, and a corrected *rate* was never a schema concern.
+
+## 2026-09-29 — A custom endpoint is priced by its host, and relax.ai in pounds
+
+Prompted by web-auditor adding relax.ai (`https://api.relax.ai/v1`) as a second provider.
+relax.ai is OpenAI-compatible and has no litellm provider, so litellm reaches it as
+`openai/<model>` with an `api_base`. Before this change that call was priced by name alone,
+and the live smoke test on 2026-09-29 showed both ways that goes wrong:
+`openai/DeepSeek-V4-Pro` resolved to litellm's `deepseek-v4-pro` entry — DeepSeek's own
+direct rate, $1.32 / $3.96 per MTok, recorded as `provider: "openai"` — and the other three
+relax.ai chat models resolved to nothing. relax.ai actually charges £1.17 / £2.33 for that
+model. A wrong vendor, a wrong rate and a wrong currency on one line, all of it plausible.
+
+**Decision: when a call carries `api_base` (or litellm's alias `base_url`, with `api_base`
+winning as it does in `litellm.completion`), the host decides first.** `_ENDPOINTS` in
+`pricing.py` maps a host to one of three outcomes:
+
+- **A provider with its own table** (`api.relax.ai` → `relax`, `RELAX_PRICES`). Priced from
+  that table and nowhere else — not `PRICES`, not litellm's catalogue. A model it does not
+  list is `null` but still attributed to `relax`. litellm's `openai/` routing prefix is
+  dropped before the lookup; it says how to talk to the host, not who hosts the model.
+- **A first-party host** (`api.anthropic.com`, `api.openai.com`,
+  `generativelanguage.googleapis.com`). Falls through to the ordinary lookup, so passing a
+  vendor's own URL explicitly changes nothing. Without this a caller doing so would have
+  gone from priced to unpriced for no reason.
+- **Anything else.** `provider` is the host, the cost is `null`, and
+  `pricing_caveat: "custom_endpoint_unpriced"` says why. This caveat outranks the modifier
+  caveats: when nobody knows who billed the call, naming fast mode would imply the cost is
+  recoverable once fast mode is priced.
+
+**Rules out:** pricing a custom endpoint's model by name "because it is the same model". It
+is the same weights at a different company's price, and the name is exactly what collides.
+
+**relax.ai rates are held in GBP, as published, and `ModelPrice` gained a `currency`
+field.** The alternative, converting to USD for the table and back to GBP in the record,
+only returns the published pound figure when both conversions use the same rate — and the
+rate is overridable per process. So the native currency is exact and the other is
+converted once: for a GBP row `cost_gbp` is exact and `cost_usd = cost_gbp × fx`.
+`costs_usd_and_gbp()` does this; `cost_usd()` now returns `None` for a non-USD price rather
+than handing back pounds labelled dollars. The `_usd_` in `ModelPrice`'s field names
+predates this and is kept so callers do not break; the docstring says what they hold.
+
+**No litellm cross-check exists for these rates.** litellm has no relax.ai entries, so the
+`TestProvenance` cross-check that caught the 2026-09-07 defects cannot cover them. The
+substitute: the rates were read from the raw pricing page, not a rendered summary, with the
+currency confirmed from the bytes (U+00A3); the model ids were confirmed against a live
+`GET /v1/models`. VAT treatment is not stated on the page and is recorded as unknown in the
+row's note, not assumed.
+
+**Known limits, documented rather than built:**
+- `api_base` is one keyword argument, so every rung of a ladder goes to the same endpoint.
+  Pinned by a test so it cannot change unnoticed.
+- An endpoint set through litellm's own configuration (`litellm.api_base`,
+  `OPENAI_BASE_URL`, `OPENAI_API_BASE`) is invisible to the record and is priced by name.
+  Reading litellm's globals and environment would mean re-implementing its precedence
+  rules, and getting them subtly wrong is worse than documenting the gap.
+- `Nemotron-3-Super` is priced, but returned `content: None` on all three smoke-test calls,
+  sending its output to `reasoning_content`. That is a consumer's problem to route around,
+  not a pricing one; web-auditor leaves it out.
+
+**Flagged, not fixed here:** README "What it promises" says an unknown model's
+`pricing_caveat` names the reason. For a plain unknown model it is `null` — only
+`pricing_source: "unknown"` says so. Pre-existing and separate from this change.
+
+**Evidence:** 35 new tests in `tests/test_custom_endpoints.py`. Sixteen mutations, sixteen
+killed, each by its intended test, files restored byte-identical each time — including the
+two orderings (`api_base` over `base_url`; endpoint caveat over modifier caveat) and
+"consult `RELAX_PRICES` by name", the plausible wrong shortcut.
+
+**Version 0.6.0, schema 3 unchanged.** A minor bump because behaviour a consumer can
+observe changes: a call with an `api_base` can now record a different `provider`, a `null`
+cost where one used to appear, and a new caveat value. No new field in the record and no new
+`status` value, which is the bar for moving the schema. `ModelPrice.currency` and
+`PriceLookup.unknown_endpoint` are new attributes with defaults, so existing constructors
+keep working.

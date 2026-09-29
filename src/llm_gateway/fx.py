@@ -22,6 +22,7 @@ __all__ = [
     "DEFAULT_RATE_DATE",
     "resolve_rate",
     "usd_to_gbp",
+    "gbp_to_usd",
 ]
 
 ENV_VAR = "LLM_GATEWAY_USD_GBP_RATE"
@@ -68,3 +69,16 @@ def usd_to_gbp(amount_usd: float | None, usd_per_gbp: float) -> float | None:
     if not usd_per_gbp > 0:
         return None
     return round(amount_usd / usd_per_gbp, 10)
+
+
+def gbp_to_usd(amount_gbp: float | None, usd_per_gbp: float) -> float | None:
+    """Convert a GBP amount to USD, or return ``None`` if there was no GBP figure.
+
+    Used for providers that publish their rates in pounds, where the pound figure is the
+    exact one and the dollar figure is the conversion.
+    """
+    if amount_gbp is None:
+        return None
+    if not usd_per_gbp > 0:
+        return None
+    return round(amount_gbp * usd_per_gbp, 10)
