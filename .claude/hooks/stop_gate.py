@@ -33,6 +33,15 @@ hook only ever reasons about ONE repo -- the one the session's turn just worked 
 a second target parsed out of a command string -- so there is no second root that has to
 stay dynamic here; the fix is a direct, unqualified port of A21's `hook_directory()`.
 
+A26: A23 WAS ONE STEP TOO FAR. Its evidence was a reset into a DIFFERENT repository
+(dev-process to web-auditor). It also stopped the gate following a deliberate move into
+another worktree of the SAME repository, and since the hook file is fixed at launch, the
+gate then judged the primary checkout for the rest of the session. `session_repo_root()`
+draws the line on repository identity: the payload's `cwd` is trusted only when it shares
+the hook root's git common dir. A foreign `cwd` is still ignored, as A23 intended.
+`os.getcwd()` plays no part. Residual, recorded, not solved: a harness reset into a
+different worktree of the same repository would be followed.
+
 Calibrated by hooks/stop_gate_selftest.py -- a known-positive and a known-negative for
 each check, plus a control proving the harness can report red. Run from CI.
 """
@@ -109,6 +118,44 @@ def repo_root_of(directory: str) -> str | None:
         return None
     code, out = git(directory, "rev-parse", "--show-toplevel")
     return out if code == 0 and out else None
+
+
+def normalised_path(path: str) -> str:
+    """A path in the form two paths are compared in: case and separators folded on
+    Windows, where git reports `C:/Users/...` and Python may hold `c:\\users\\...`."""
+    return os.path.normcase(os.path.normpath(path))
+
+
+def git_common_dir(repo_root: str) -> str | None:
+    """The repository's shared .git directory, identical for every worktree of it.
+
+    `--path-format` needs git 2.31+. Older git exits non-zero here, which reads as "cannot
+    tell" and sends the caller back to the hook root -- A23's behaviour, not a new failure.
+    """
+    code, out = git(repo_root, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    return normalised_path(out) if code == 0 and out else None
+
+
+def session_repo_root(payload_cwd: object, hook_root: str) -> str:
+    """The work tree to judge: the session's own, when it is safe to believe.
+
+    A26. The hook file is fixed at session launch, so `hook_root` is always the checkout the
+    session started in. A session that then moves into another worktree of the SAME
+    repository -- measured 2026-09-25, web-auditor session 1aa9887b -- must be judged on
+    that worktree, or a primary checkout left dirty on main by someone else blocks every
+    turn. So the payload's `cwd` wins exactly when it resolves to a work tree sharing
+    `hook_root`'s git common dir; anything else (absent, not a repository, a different
+    repository, git unable to say) falls back to `hook_root`.
+    """
+    if not isinstance(payload_cwd, str) or not payload_cwd:
+        return hook_root
+    candidate = repo_root_of(payload_cwd)
+    if candidate is None:
+        return hook_root
+    candidate_common = git_common_dir(candidate)
+    if candidate_common is None or candidate_common != git_common_dir(hook_root):
+        return hook_root
+    return candidate
 
 
 def current_branch(repo_root: str) -> str | None:
@@ -350,9 +397,10 @@ def evaluate(payload: dict) -> dict | None:
     started = time.monotonic()
 
     try:
-        repo_root = repo_root_of(hook_directory())
-        if repo_root is None:
+        hook_root = repo_root_of(hook_directory())
+        if hook_root is None:
             return None
+        repo_root = session_repo_root(payload.get("cwd"), hook_root)
 
         # An empty repository has no HEAD to reason about.
         if not ref_exists(repo_root, "HEAD"):
