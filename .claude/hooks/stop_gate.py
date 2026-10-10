@@ -55,10 +55,37 @@ trees, falling back to the cwd root only when there is no such evidence. `branch
 judges those trees AND the cwd root, so it is never narrower than A26. Every block names
 the trees judged and the payload's `cwd`, so a future misfire reports its own inputs.
 Residuals, recorded, not solved: a `cd $VAR` target cannot be resolved and is skipped; a
-commit made by a route with no recognisable trace (a script, an alias), in a session that
-also committed elsewhere, loses plan_first on the cwd root; subagent transcripts are not
-read; the transcript's JSONL shape is the app's, not a documented contract -- if it changes,
-evidence goes empty and the gate falls back to A26's behaviour, it does not fail.
+commit made by a route with no recognisable trace (a script, an alias) loses plan_first on
+the cwd root; subagent transcripts are not read; the transcript's JSONL shape is the app's,
+not a documented contract -- if it changes, no tool call is recognised and the gate falls
+back to A26's behaviour, it does not fail.
+
+A27b: NO EVIDENCE IS NOT A REASON TO JUDGE THE CWD. A27 still fell back to the cwd root for
+plan_first whenever the transcript showed no write or commit, so a session started in a
+primary checkout parked on a code-first branch (roadmap/phase-0, 2026-10-10) was blocked on
+every turn before its first write -- for a commit it did not make. plan_first now judges
+exactly the trees the session wrote or committed in, possibly none, whenever the transcript
+was understood (at least one tool call recognised). The cwd fallback is kept only for a
+transcript in which no tool call is recognised: absent, unreadable, or a changed shape.
+Nothing is lost -- the first write or commit in a tree puts it in scope on that turn.
+Residual: a text-only turn cannot be told from a changed shape, so it is judged on the cwd.
+That same report's every-turn block was NOT this gap: the primary checkout was still running
+its A26r copy (the hook runs from $CLAUDE_PROJECT_DIR), so A27 had never loaded there.
+
+A37: A SESSION IS JUDGED ON ITS OWN COMMITS. A27b settled which TREES are this session's;
+plan_first still took a branch's very first commit as the session's, so continuing a branch
+an earlier session had started code-first blocked "the first commit is not the plan" no
+matter what this session did (2026-09-15, b6b-pre-registration; A32's case 30). The session's
+start is now read from its transcript's timestamps, and a commit authored before it belongs
+to an earlier session: see `continued_branch_verdict`. No timestamp means the ordinary rule.
+Residuals, recorded, not solved: `/resume` keeps the original transcript, so a resumed
+conversation's earlier commits count as this session's; a commit cherry-picked this session
+from older work keeps its old author date and is not judged; clock skew between the machine
+that authored a commit and this one moves the line by that much.
+
+A38: SHIPPED WORK IS NOT JUDGED. A squash merge leaves the branch's own commits off main's
+ancestry, so a session left on a merged code-first branch was blocked about finished work
+(A32's case 32). See `work_has_shipped`.
 
 Calibrated by hooks/stop_gate_selftest.py -- a known-positive and a known-negative for
 each check, plus a control proving the harness can report red. Run from CI.
@@ -74,6 +101,7 @@ import shlex
 import subprocess
 import sys
 import time
+from datetime import datetime
 
 # A single git call should take milliseconds. The timeout is for a hung or prompting
 # git (credential helper, filesystem lock), not for slow work.
@@ -92,6 +120,10 @@ DEFAULT_PLAN_GLOBS = ("docs/*plan*.md",)
 PLAN_EXEMPT_TRAILER = re.compile(r"^Plan-exempt:[ \t]*(\S.*)$", re.MULTILINE)
 
 CONFIG_RELATIVE_PATH = os.path.join(".claude", "turn-gate.json")
+
+# A37: how many transcript lines to read for the session's start time. The opening entries
+# carry it; reading further would only make a long session's every Stop slower.
+SESSION_START_SCAN_LINES = 50
 
 # A27: what in a transcript counts as this session having worked in a tree. Writing a file,
 # or running a git command that moves a branch. Reading does not count, deliberately: a
@@ -215,6 +247,47 @@ def transcript_tool_calls(transcript_path: object):
                 yield from tool_calls_in_entry(line)
     except OSError:
         return
+
+
+def transcript_session_start(transcript_path: object) -> float | None:
+    """A37: when this session began, as epoch seconds, or None when the transcript cannot say.
+
+    The earliest `timestamp` among the leading entries, not the first line's: measured
+    2026-10-10 on a desktop-app transcript, every entry carries an ISO-8601 UTC timestamp,
+    but the opening entries are not written in time order. Only the head is read, so the
+    cost does not grow with the session.
+    """
+    if not isinstance(transcript_path, str) or not transcript_path:
+        return None
+    earliest: float | None = None
+    try:
+        with open(transcript_path, encoding="utf-8", errors="replace") as handle:
+            for index, line in enumerate(handle):
+                if index >= SESSION_START_SCAN_LINES:
+                    break
+                moment = entry_timestamp(line)
+                if moment is not None and (earliest is None or moment < earliest):
+                    earliest = moment
+    except OSError:
+        return None
+    return earliest
+
+
+def entry_timestamp(line: str) -> float | None:
+    try:
+        entry = json.loads(line)
+    except ValueError:
+        return None
+    raw = entry.get("timestamp") if isinstance(entry, dict) else None
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        # fromisoformat() before Python 3.11 rejects a trailing "Z".
+        moment = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    # A naive time cannot be placed against git's epoch seconds without guessing a zone.
+    return moment.timestamp() if moment.tzinfo is not None else None
 
 
 def tool_calls_in_entry(line: str):
@@ -362,13 +435,15 @@ def worktrees_worked_in(directories: list[str], hook_root: str) -> list[str]:
     return list(found.values())
 
 
-def check_scopes(worked_in: list[str], cwd_root: str) -> dict[str, list[str]]:
-    """Which trees each check judges. See A27 in the module docstring for why they differ."""
+def check_scopes(worked_in: list[str], cwd_root: str,
+                 transcript_understood: bool) -> dict[str, list[str]]:
+    """Which trees each check judges. See A27 and A27b in the module docstring for why
+    they differ, and why plan_first can judge no tree at all."""
     hygiene: dict[str, str] = {normalised_path(tree): tree for tree in worked_in}
     hygiene.setdefault(normalised_path(cwd_root), cwd_root)
     return {
         "branch_hygiene": list(hygiene.values()),
-        "plan_first": list(worked_in) or [cwd_root],
+        "plan_first": list(worked_in) if transcript_understood else [cwd_root],
     }
 
 
@@ -468,13 +543,18 @@ def is_plan_file(path: str, globs: tuple[str, ...]) -> bool:
 # Each check returns a reason string when the invariant is broken, or None when it holds
 # or cannot be evaluated. Cannot-evaluate is always a pass: a gate that blocks because it
 # is confused trains the session to ignore it.
+#
+# Every check takes the same four arguments. `session_start` (A37) is the session's start
+# as epoch seconds, from its transcript, or None when the transcript cannot say.
 
 
-def check_branch_hygiene(repo_root: str, config: dict, default_branch: str) -> str | None:
+def check_branch_hygiene(repo_root: str, config: dict, default_branch: str,
+                         session_start: float | None) -> str | None:
     """Work must not accumulate on a protected branch.
 
     Untracked files never count. A session that has generated a scratch file, or a
     reviewer's stray .docx sitting in docs/, has not started work on main.
+    `session_start` is unused: work left on main is a problem whoever left it.
     """
     branch = current_branch(repo_root)
     if branch is None or branch not in resolve_protected_branches(config, default_branch):
@@ -520,7 +600,107 @@ def check_branch_hygiene(repo_root: str, config: dict, default_branch: str) -> s
     )
 
 
-def check_plan_first(repo_root: str, config: dict, default_branch: str) -> str | None:
+def work_has_shipped(repo_root: str, base_ref: str, changed: list[str]) -> bool:
+    """True when every file the branch changed already reads the same on `base_ref`.
+
+    A38. A squash merge lands the branch as one new commit, so the branch's own commits are
+    never ancestors of main: the merge-base stays at the old fork point and the branch still
+    looks like multi-file work. A session left on that branch was blocked about work that
+    had shipped. Comparing content, not ancestry, sees through the squash.
+
+    Residual, recorded: once main edits one of those files again, or the branch gains a
+    commit after the squash, the content differs and the ordinary rule applies. Anything
+    git cannot answer (exit code other than 0) reads as not shipped -- the ordinary rule.
+    """
+    code, _ = git(repo_root, "diff", "--quiet", "HEAD", base_ref, "--", *changed)
+    return code == 0
+
+
+def has_plan_exempt_trailer(repo_root: str, commit: str) -> bool:
+    code, message = git(repo_root, "log", "-1", "--format=%B", commit)
+    return code == 0 and PLAN_EXEMPT_TRAILER.search(message) is not None
+
+
+def branch_history(repo_root: str, base: str) -> list[tuple[str, int, list[str]]]:
+    """(commit, author date in epoch seconds, files touched) for base..HEAD, oldest first.
+
+    One git call however long the branch. A merge lists no files, as with `git show`.
+    An empty list means git could not say, and the caller falls back to the ordinary rule.
+    """
+    code, out = git(repo_root, "log", "--reverse", "--topo-order", "--format=%x00%H %at",
+                    "--name-only", f"{base}..HEAD")
+    if code != 0:
+        return []
+    history = []
+    for record in out.split("\x00"):
+        lines = [line.strip() for line in record.splitlines() if line.strip()]
+        if not lines:
+            continue
+        header = lines[0].split()
+        if len(header) != 2 or not header[1].isdigit():
+            return []
+        history.append((header[0], int(header[1]), lines[1:]))
+    return history
+
+
+def not_the_plan(headline: str, files: list[str], globs: tuple[str, ...], fix: str) -> str:
+    """The block message plan_first gives, whichever commit it is about."""
+    listed_files = ", ".join(files[:5]) + ("…" if len(files) > 5 else "")
+    return (
+        f"{headline}\n"
+        f"It touches: {listed_files or '(nothing)'}\n"
+        f"The plan must be committed on its own, before any code, matching "
+        f"{' or '.join(globs)} -- a session can end without warning, and what dies with "
+        "it is whatever was held only in the conversation.\n"
+        f"Fix: {fix}"
+    )
+
+
+def continued_branch_verdict(repo_root: str, base: str, branch: str,
+                             globs: tuple[str, ...],
+                             session_start: float) -> tuple[bool, str | None]:
+    """A37: judge only this session's commits on a branch an earlier session started.
+
+    Returns (judged, reason). judged is False when the branch is not a continued one --
+    every commit is this session's, or git could not list them -- and the caller then
+    applies the ordinary rule. A commit is this session's when its AUTHOR date is at or
+    after the session start; the author date survives a rebase or an amend, so reworking
+    an earlier session's commits does not make them this session's.
+
+    A continued branch passes when a plan is in git before this session's first code
+    commit: on any earlier commit, or on a plan-only commit this session made first. Its
+    first code commit may also carry a `Plan-exempt:` trailer. A session that has
+    committed nothing on the branch passes: what is there is not its to fix.
+    """
+    history = branch_history(repo_root, base)
+    cutoff = int(session_start)  # git author dates are whole seconds
+    if not history or all(author_date >= cutoff for _, author_date, _ in history):
+        return False, None
+
+    plan_seen = False
+    for commit, author_date, files in history:
+        if author_date < cutoff:
+            plan_seen = plan_seen or any(is_plan_file(path, globs) for path in files)
+            continue
+        if not files:  # a merge: nothing of its own to judge
+            continue
+        if all(is_plan_file(path, globs) for path in files):
+            plan_seen = True
+            continue
+        if plan_seen or has_plan_exempt_trailer(repo_root, commit):
+            return True, None
+        return True, not_the_plan(
+            f"This session's first code commit on '{branch}' ({commit[:8]}) is not the "
+            "plan, and no commit before it on the branch carries one.",
+            files, globs,
+            f"commit the plan doc on its own and rebase it in front of {commit[:8]}, or "
+            "record a deliberate skip with a `Plan-exempt: <reason>` trailer on that commit.",
+        )
+    return True, None
+
+
+def check_plan_first(repo_root: str, config: dict, default_branch: str,
+                     session_start: float | None) -> str | None:
     """The branch's first commit must be the plan, alone, before any code.
 
     A6's rule. Three sessions have died after planning was done, and what died with them
@@ -529,7 +709,9 @@ def check_plan_first(repo_root: str, config: dict, default_branch: str) -> str |
 
     Exempt by the rule's own terms: single-file branches (PROCESS.md requires plan mode
     for *multi-file* work), branches with nothing committed yet, and a first commit
-    carrying a `Plan-exempt: <reason>` trailer.
+    carrying a `Plan-exempt: <reason>` trailer. Also exempt: a branch whose work has
+    already shipped (A38, see `work_has_shipped`). A branch an earlier session started is
+    judged on this session's commits only (A37, see `continued_branch_verdict`).
     """
     branch = current_branch(repo_root)
     if branch is None or branch in resolve_protected_branches(config, default_branch):
@@ -555,6 +737,16 @@ def check_plan_first(repo_root: str, config: dict, default_branch: str) -> str |
     if code != 0 or len(changed) < 2:
         return None
 
+    if work_has_shipped(repo_root, base_ref, changed):
+        return None
+
+    globs = plan_globs(config)
+    if session_start is not None:
+        judged, reason = continued_branch_verdict(repo_root, base, branch, globs,
+                                                  session_start)
+        if judged:
+            return reason
+
     first = commits[0]
 
     # A merge as the first commit ahead of base is a rebase artefact or an integration,
@@ -563,26 +755,19 @@ def check_plan_first(repo_root: str, config: dict, default_branch: str) -> str |
     if code == 0 and len(parents.split()) > 2:
         return None
 
-    code, message = git(repo_root, "log", "-1", "--format=%B", first)
-    exempt = PLAN_EXEMPT_TRAILER.search(message) if code == 0 else None
-    if exempt:
+    if has_plan_exempt_trailer(repo_root, first):
         return None
 
     code, shown = git(repo_root, "show", "--name-only", "--format=", first)
     first_files = [line for line in shown.splitlines() if line.strip()]
-    globs = plan_globs(config)
     if first_files and all(is_plan_file(path, globs) for path in first_files):
         return None
 
-    listed_files = ", ".join(first_files[:5]) + ("…" if len(first_files) > 5 else "")
-    return (
-        f"The first commit on '{branch}' ({first[:8]}) is not the plan.\n"
-        f"It touches: {listed_files or '(nothing)'}\n"
-        f"The plan must be committed on its own, before any code, matching "
-        f"{' or '.join(globs)} -- a session can end without warning, and what dies with "
-        "it is whatever was held only in the conversation.\n"
-        "Fix: write the plan doc and rebase it to the front, or record a deliberate "
-        "skip with a `Plan-exempt: <reason>` trailer on that first commit."
+    return not_the_plan(
+        f"The first commit on '{branch}' ({first[:8]}) is not the plan.",
+        first_files, globs,
+        "write the plan doc and rebase it to the front, or record a deliberate "
+        "skip with a `Plan-exempt: <reason>` trailer on that first commit.",
     )
 
 
@@ -612,18 +797,22 @@ def located(reason: str, repo_root: str, hook_root: str) -> str:
     return f"In worktree {repo_root}:\n{reason}"
 
 
-def judged_line(worked_in: list[str], cwd_root: str, payload_cwd: object) -> str:
+def judged_line(scopes: dict[str, list[str]], transcript_understood: bool,
+                payload_cwd: object) -> str:
     """One line saying what was judged and from what, so a misfire reports its own inputs."""
-    if worked_in:
+    trees = scopes["plan_first"]
+    if not transcript_understood:
+        source = "the session cwd (no tool call recognised in the transcript)"
+    elif trees:
         source = "this session's commits and file writes, from its transcript"
-        trees = worked_in
     else:
-        source = "the session cwd (no commits or file writes found in the transcript)"
-        trees = [cwd_root]
+        source = "this session's transcript, which shows no commits or file writes"
+    shown_trees = ", ".join(trees) if trees else "(no tree)"
     # Not repr(): it doubles every Windows backslash, and the path is read by a person.
     shown_cwd = payload_cwd if isinstance(payload_cwd, str) and payload_cwd else "(absent)"
     return (
-        f"Judged: {', '.join(trees)} -- plan-first scope from {source}; "
+        f"Judged: plan-first on {shown_trees}, from {source}; "
+        f"branch hygiene on {', '.join(scopes['branch_hygiene'])}; "
         f"payload cwd: {shown_cwd}."
     )
 
@@ -648,11 +837,11 @@ def evaluate(payload: dict) -> dict | None:
         if hook_root is None:
             return None
         cwd_root = session_repo_root(payload.get("cwd"), hook_root)
-        worked_in = worktrees_worked_in(
-            evidence_directories(transcript_tool_calls(payload.get("transcript_path"))),
-            hook_root,
-        )
-        scopes = check_scopes(worked_in, cwd_root)
+        tool_calls = list(transcript_tool_calls(payload.get("transcript_path")))
+        transcript_understood = bool(tool_calls)
+        worked_in = worktrees_worked_in(evidence_directories(tool_calls), hook_root)
+        scopes = check_scopes(worked_in, cwd_root, transcript_understood)
+        session_start = transcript_session_start(payload.get("transcript_path"))
 
         settings: dict[str, tuple[dict, str] | None] = {}
         reasons: list[str] = []
@@ -672,7 +861,7 @@ def evaluate(payload: dict) -> dict | None:
                 config, default_branch = settings[repo_root]
                 if not check_enabled(config, name):
                     continue
-                reason = check(repo_root, config, default_branch)
+                reason = check(repo_root, config, default_branch, session_start)
                 if reason:
                     reasons.append(located(reason, repo_root, hook_root))
     except GateError as exc:
@@ -689,7 +878,7 @@ def evaluate(payload: dict) -> dict | None:
         "reason": (
             "The turn-level gate blocked this turn. Fix the following, then finish.\n\n"
             f"{body}\n\n"
-            f"{judged_line(worked_in, cwd_root, payload.get('cwd'))}\n\n"
+            f"{judged_line(scopes, transcript_understood, payload.get('cwd'))}\n\n"
             "This gate blocks once per turn -- if it is wrong, say so and continue; "
             "the next stop will not be blocked."
         ),
