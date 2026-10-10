@@ -42,6 +42,24 @@ the hook root's git common dir. A foreign `cwd` is still ignored, as A23 intende
 `os.getcwd()` plays no part. Residual, recorded, not solved: a harness reset into a
 different worktree of the same repository would be followed.
 
+A27: `cwd` IS NOT WHERE THE SESSION WORKED. Measured 2026-10-10 from four desktop-app
+transcripts (web-auditor #624, #629, phase-1): a session started in the primary checkout
+that works in a sibling worktree via `cd <worktree> && ...` has its tracked cwd reset to
+the primary after every such call ("Shell cwd was reset", 264 times in one session), so
+the payload's `cwd` is always the primary. A26 never sees the move. The gate judged the
+primary's branch -- blocking every turn on a finding the session did not cause -- and never
+judged the worktree branch the session was building, so a real violation there passed.
+The session's transcript (`transcript_path`, a documented hook input) records where it
+actually committed and wrote: `worktrees_worked_in()` reads that. `plan_first` judges those
+trees, falling back to the cwd root only when there is no such evidence. `branch_hygiene`
+judges those trees AND the cwd root, so it is never narrower than A26. Every block names
+the trees judged and the payload's `cwd`, so a future misfire reports its own inputs.
+Residuals, recorded, not solved: a `cd $VAR` target cannot be resolved and is skipped; a
+commit made by a route with no recognisable trace (a script, an alias), in a session that
+also committed elsewhere, loses plan_first on the cwd root; subagent transcripts are not
+read; the transcript's JSONL shape is the app's, not a documented contract -- if it changes,
+evidence goes empty and the gate falls back to A26's behaviour, it does not fail.
+
 Calibrated by hooks/stop_gate_selftest.py -- a known-positive and a known-negative for
 each check, plus a control proving the harness can report red. Run from CI.
 """
@@ -52,6 +70,7 @@ import fnmatch
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -73,6 +92,24 @@ DEFAULT_PLAN_GLOBS = ("docs/*plan*.md",)
 PLAN_EXEMPT_TRAILER = re.compile(r"^Plan-exempt:[ \t]*(\S.*)$", re.MULTILINE)
 
 CONFIG_RELATIVE_PATH = os.path.join(".claude", "turn-gate.json")
+
+# A27: what in a transcript counts as this session having worked in a tree. Writing a file,
+# or running a git command that moves a branch. Reading does not count, deliberately: a
+# session looking at another session's worktree must not inherit that branch's findings.
+FILE_WRITE_TOOLS = {"Edit": "file_path", "Write": "file_path", "MultiEdit": "file_path",
+                    "NotebookEdit": "notebook_path"}
+SHELL_TOOLS = frozenset({"Bash", "PowerShell"})
+MUTATING_GIT_VERBS = frozenset({"commit", "checkout", "switch", "rebase", "cherry-pick",
+                                "merge", "reset", "am", "revert"})
+CHANGE_DIRECTORY_COMMANDS = frozenset({"cd", "pushd", "chdir", "set-location", "sl"})
+# git global options that take the next word as their value.
+GIT_OPTIONS_WITH_VALUE = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace"})
+# Approximate, not a shell parser: a separator inside a quoted string splits it wrongly.
+# Accepted, because the cost is at worst one tree missed or added, and only a tree that
+# the same command already named or stood in.
+COMMAND_SEPARATOR = re.compile(r"&&|\|\||[;|\n]")
+ENVIRONMENT_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+MSYS_DRIVE = re.compile(r"^/([A-Za-z])(?=/|$)")
 
 
 class GateError(Exception):
@@ -156,6 +193,183 @@ def session_repo_root(payload_cwd: object, hook_root: str) -> str:
     if candidate_common is None or candidate_common != git_common_dir(hook_root):
         return hook_root
     return candidate
+
+
+# ------------------------------------------------------- A27: transcript evidence
+
+
+def transcript_tool_calls(transcript_path: object):
+    """Yield (tool name, tool input, entry cwd) for every tool call in the transcript.
+
+    Yields nothing for an absent, unreadable or unrecognisable transcript: no evidence is
+    the A26 behaviour, never a failure. The `"tool_use"` substring test is a prefilter so a
+    multi-megabyte transcript costs tens of milliseconds (measured: 0.05 s for 6 MB).
+    """
+    if not isinstance(transcript_path, str) or not transcript_path:
+        return
+    try:
+        with open(transcript_path, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if '"tool_use"' not in line:
+                    continue
+                yield from tool_calls_in_entry(line)
+    except OSError:
+        return
+
+
+def tool_calls_in_entry(line: str):
+    try:
+        entry = json.loads(line)
+    except ValueError:
+        return
+    if not isinstance(entry, dict):
+        return
+    message = entry.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
+        return
+    entry_cwd = entry.get("cwd") if isinstance(entry.get("cwd"), str) else ""
+    for block in content:
+        if (isinstance(block, dict) and block.get("type") == "tool_use"
+                and isinstance(block.get("input"), dict)):
+            yield str(block.get("name", "")), block["input"], entry_cwd
+
+
+def local_path(written: str) -> str:
+    """A path as a command wrote it, in the form this OS opens: quotes stripped, and on
+    Windows Git Bash's `/c/Users/...` turned into `C:/Users/...`."""
+    path = written.strip().strip("\"'")
+    if os.name == "nt":
+        path = MSYS_DRIVE.sub(lambda match: f"{match.group(1).upper()}:", path, count=1)
+    return path
+
+
+def resolve_directory(written: str, base: str | None) -> str | None:
+    """An absolute directory for a path written in a command, or None when it cannot be
+    known statically (a variable, `~`, `cd -`, or relative with no base)."""
+    path = local_path(written)
+    if not path or path == "-" or path.startswith("~") or "$" in path or "%" in path:
+        return None
+    if not os.path.isabs(path):
+        if not base:
+            return None
+        path = os.path.join(base, path)
+    return os.path.normpath(path)
+
+
+def shell_words(segment: str) -> list[str]:
+    """Split one command segment into words, quotes stripped. Not POSIX mode, so a
+    Windows backslash survives; unbalanced quotes give no words rather than a guess."""
+    try:
+        words = shlex.split(segment, posix=False)
+    except ValueError:
+        return []
+    words = [word.strip("\"'") for word in words]
+    while words and ENVIRONMENT_ASSIGNMENT.match(words[0]):
+        words.pop(0)
+    return words
+
+
+def git_verb_and_directory(words: list[str]) -> tuple[str | None, str | None]:
+    """For a `git ...` word list: the subcommand, and the `-C` directory if one was given."""
+    directory = None
+    index = 1
+    while index < len(words):
+        word = words[index]
+        if word in GIT_OPTIONS_WITH_VALUE and index + 1 < len(words):
+            if word == "-C":
+                directory = words[index + 1]
+            index += 2
+        elif word.startswith("-"):
+            index += 1
+        else:
+            return word, directory
+    return None, directory
+
+
+def command_evidence(command: str, entry_cwd: str) -> list[str]:
+    """Directories a shell command ran a branch-moving git command in.
+
+    Walks the command's segments in order, tracking the directory each `cd` moves to,
+    starting from the entry's own cwd. A `cd` that cannot be resolved makes the directory
+    unknown until the next one, so `cd $WT && git commit` is skipped, not misattributed.
+    """
+    current: str | None = entry_cwd or None
+    found: list[str] = []
+    for segment in COMMAND_SEPARATOR.split(command):
+        words = shell_words(segment.strip())
+        if not words:
+            continue
+        head = words[0].lower()
+        if head in CHANGE_DIRECTORY_COMMANDS:
+            targets = [word for word in words[1:] if not word.startswith("-")]
+            current = resolve_directory(targets[0], current) if targets else None
+            continue
+        if os.path.basename(head) not in ("git", "git.exe"):
+            continue
+        verb, directory = git_verb_and_directory(words)
+        if verb not in MUTATING_GIT_VERBS:
+            continue
+        target = resolve_directory(directory, current) if directory else current
+        if target:
+            found.append(target)
+    return found
+
+
+def evidence_directories(tool_calls) -> list[str]:
+    """Every directory the session wrote a file in or moved a branch in, first seen first."""
+    found: dict[str, None] = {}
+    for name, tool_input, entry_cwd in tool_calls:
+        if name in FILE_WRITE_TOOLS:
+            written = tool_input.get(FILE_WRITE_TOOLS[name])
+            if isinstance(written, str) and written:
+                directory = resolve_directory(os.path.dirname(local_path(written)), entry_cwd)
+                if directory:
+                    found.setdefault(directory, None)
+        elif name in SHELL_TOOLS:
+            command = tool_input.get("command")
+            if isinstance(command, str):
+                for directory in command_evidence(command, entry_cwd):
+                    found.setdefault(directory, None)
+    return list(found)
+
+
+def repository_worktrees(hook_root: str) -> list[str]:
+    """Every work tree of the hook's repository, as git reports them. One git call, so the
+    number of evidence directories does not multiply the hook's cost."""
+    code, out = git(hook_root, "worktree", "list", "--porcelain")
+    if code != 0:
+        return []
+    return [line[len("worktree "):] for line in out.splitlines() if line.startswith("worktree ")]
+
+
+def worktrees_worked_in(directories: list[str], hook_root: str) -> list[str]:
+    """The work trees of THIS repository containing any of `directories`.
+
+    Longest match wins, so a worktree nested inside the primary (`.claude/worktrees/x`) is
+    told apart from the primary itself. A directory in another repository matches nothing.
+    """
+    trees = sorted(repository_worktrees(hook_root),
+                   key=lambda tree: len(normalised_path(tree)), reverse=True)
+    found: dict[str, str] = {}
+    for directory in directories:
+        key = normalised_path(directory)
+        for tree in trees:
+            tree_key = normalised_path(tree)
+            if key == tree_key or key.startswith(tree_key.rstrip(os.sep) + os.sep):
+                found.setdefault(tree_key, tree)
+                break
+    return list(found.values())
+
+
+def check_scopes(worked_in: list[str], cwd_root: str) -> dict[str, list[str]]:
+    """Which trees each check judges. See A27 in the module docstring for why they differ."""
+    hygiene: dict[str, str] = {normalised_path(tree): tree for tree in worked_in}
+    hygiene.setdefault(normalised_path(cwd_root), cwd_root)
+    return {
+        "branch_hygiene": list(hygiene.values()),
+        "plan_first": list(worked_in) or [cwd_root],
+    }
 
 
 def current_branch(repo_root: str) -> str | None:
@@ -381,6 +595,39 @@ CHECKS = (
 # ------------------------------------------------------------------- evaluation
 
 
+def tree_settings(repo_root: str) -> tuple[dict, str] | None:
+    """(config, default branch) for one tree, or None when it has no HEAD to reason about
+    (an empty repository, or a worktree directory removed since the session wrote there)."""
+    if not ref_exists(repo_root, "HEAD"):
+        return None
+    config = load_config(repo_root)
+    return config, resolve_default_branch(repo_root, config)
+
+
+def located(reason: str, repo_root: str, hook_root: str) -> str:
+    """Prefix a finding with its tree whenever that is not the checkout the session
+    started in -- with several trees judged, a bare branch name is not enough to act on."""
+    if normalised_path(repo_root) == normalised_path(hook_root):
+        return reason
+    return f"In worktree {repo_root}:\n{reason}"
+
+
+def judged_line(worked_in: list[str], cwd_root: str, payload_cwd: object) -> str:
+    """One line saying what was judged and from what, so a misfire reports its own inputs."""
+    if worked_in:
+        source = "this session's commits and file writes, from its transcript"
+        trees = worked_in
+    else:
+        source = "the session cwd (no commits or file writes found in the transcript)"
+        trees = [cwd_root]
+    # Not repr(): it doubles every Windows backslash, and the path is read by a person.
+    shown_cwd = payload_cwd if isinstance(payload_cwd, str) and payload_cwd else "(absent)"
+    return (
+        f"Judged: {', '.join(trees)} -- plan-first scope from {source}; "
+        f"payload cwd: {shown_cwd}."
+    )
+
+
 def evaluate(payload: dict) -> dict | None:
     """Return the JSON document to print, or None to stay silent.
 
@@ -400,29 +647,34 @@ def evaluate(payload: dict) -> dict | None:
         hook_root = repo_root_of(hook_directory())
         if hook_root is None:
             return None
-        repo_root = session_repo_root(payload.get("cwd"), hook_root)
+        cwd_root = session_repo_root(payload.get("cwd"), hook_root)
+        worked_in = worktrees_worked_in(
+            evidence_directories(transcript_tool_calls(payload.get("transcript_path"))),
+            hook_root,
+        )
+        scopes = check_scopes(worked_in, cwd_root)
 
-        # An empty repository has no HEAD to reason about.
-        if not ref_exists(repo_root, "HEAD"):
-            return None
-
-        config = load_config(repo_root)
-        default_branch = resolve_default_branch(repo_root, config)
-
+        settings: dict[str, tuple[dict, str] | None] = {}
         reasons: list[str] = []
         for name, check in CHECKS:
-            if time.monotonic() - started > WALL_CLOCK_BUDGET_SECONDS:
-                return {
-                    "systemMessage": (
-                        "Turn gate: gave up after "
-                        f"{WALL_CLOCK_BUDGET_SECONDS:.0f}s without finishing. Not blocking."
-                    )
-                }
-            if not check_enabled(config, name):
-                continue
-            reason = check(repo_root, config, default_branch)
-            if reason:
-                reasons.append(reason)
+            for repo_root in scopes[name]:
+                if time.monotonic() - started > WALL_CLOCK_BUDGET_SECONDS:
+                    return {
+                        "systemMessage": (
+                            "Turn gate: gave up after "
+                            f"{WALL_CLOCK_BUDGET_SECONDS:.0f}s without finishing. Not blocking."
+                        )
+                    }
+                if repo_root not in settings:
+                    settings[repo_root] = tree_settings(repo_root)
+                if settings[repo_root] is None:
+                    continue
+                config, default_branch = settings[repo_root]
+                if not check_enabled(config, name):
+                    continue
+                reason = check(repo_root, config, default_branch)
+                if reason:
+                    reasons.append(located(reason, repo_root, hook_root))
     except GateError as exc:
         return {"systemMessage": f"Turn gate did not run: {exc}. Not blocking."}
     except Exception as exc:  # noqa: BLE001 -- fail open on anything, but say so
@@ -437,6 +689,7 @@ def evaluate(payload: dict) -> dict | None:
         "reason": (
             "The turn-level gate blocked this turn. Fix the following, then finish.\n\n"
             f"{body}\n\n"
+            f"{judged_line(worked_in, cwd_root, payload.get('cwd'))}\n\n"
             "This gate blocks once per turn -- if it is wrong, say so and continue; "
             "the next stop will not be blocked."
         ),
