@@ -95,6 +95,7 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import math
 import os
 import re
 import shlex
@@ -108,8 +109,19 @@ from datetime import datetime
 GIT_TIMEOUT_SECONDS = 10
 
 # Total budget for all checks. The pre-push hook has blown a tool timeout once, so this
-# is stated rather than assumed. Expected real cost is well under 100 ms.
+# is stated rather than assumed. Measured 2026-10-13 on Windows: about 2 s for a session
+# that worked in one sibling worktree -- 24 git calls at roughly 85 ms each, nearly all of
+# it process start-up. CPU contention can more than double that, so on a busy machine the
+# real cost can pass 5 s and the gate gives up rather than judges.
 WALL_CLOCK_BUDGET_SECONDS = 5.0
+
+# Replace WALL_CLOCK_BUDGET_SECONDS and GIT_TIMEOUT_SECONDS for one run, so a test can
+# judge the decision path without racing the clock on a loaded machine, where a single
+# git call has been measured stalling past 30 s. The budget may be 0, to drive the
+# give-up path on purpose; the git timeout may not. Nothing in the harness sets either.
+# An unusable value is ignored and the default applies: the gate still runs on time.
+BUDGET_OVERRIDE_ENV = "TURN_GATE_BUDGET_SECONDS"
+GIT_TIMEOUT_OVERRIDE_ENV = "TURN_GATE_GIT_TIMEOUT_SECONDS"
 
 # fnmatch's `*` spans `/`, so this one pattern also covers docs/workpackages/WP-x-plan.md
 # and anything else nested under docs/. Matching is case-insensitive.
@@ -148,6 +160,31 @@ class GateError(Exception):
     """A condition the hook cannot evaluate. Fails open, with a visible warning."""
 
 
+def seconds_override(name: str, default: float, *, allow_zero: bool) -> float:
+    """A time limit from the environment variable `name`, or `default` when it is unset,
+    not a number, not finite, negative, or zero where zero is not allowed."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    if not math.isfinite(value) or value < 0 or (value == 0 and not allow_zero):
+        return default
+    return value
+
+
+def wall_clock_budget() -> float:
+    """Seconds this run may spend on its checks. See BUDGET_OVERRIDE_ENV."""
+    return seconds_override(BUDGET_OVERRIDE_ENV, WALL_CLOCK_BUDGET_SECONDS, allow_zero=True)
+
+
+def git_timeout() -> float:
+    """Seconds one git call may take. See GIT_TIMEOUT_OVERRIDE_ENV."""
+    return seconds_override(GIT_TIMEOUT_OVERRIDE_ENV, GIT_TIMEOUT_SECONDS, allow_zero=False)
+
+
 # --------------------------------------------------------------------------- git
 
 
@@ -165,7 +202,7 @@ def git(repo_root: str, *args: str) -> tuple[int, str]:
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=GIT_TIMEOUT_SECONDS,
+            timeout=git_timeout(),
         )
     except FileNotFoundError as exc:  # git not on PATH
         raise GateError("git is not on PATH") from exc
@@ -831,6 +868,7 @@ def evaluate(payload: dict) -> dict | None:
         return None
 
     started = time.monotonic()
+    budget = wall_clock_budget()
 
     try:
         hook_root = repo_root_of(hook_directory())
@@ -847,11 +885,11 @@ def evaluate(payload: dict) -> dict | None:
         reasons: list[str] = []
         for name, check in CHECKS:
             for repo_root in scopes[name]:
-                if time.monotonic() - started > WALL_CLOCK_BUDGET_SECONDS:
+                if time.monotonic() - started > budget:
                     return {
                         "systemMessage": (
                             "Turn gate: gave up after "
-                            f"{WALL_CLOCK_BUDGET_SECONDS:.0f}s without finishing. Not blocking."
+                            f"{budget:g}s without finishing. Not blocking."
                         )
                     }
                 if repo_root not in settings:

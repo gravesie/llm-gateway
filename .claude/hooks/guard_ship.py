@@ -71,7 +71,10 @@ FAILURE POSTURE, IN THREE LAYERS. Read them as one design, not three fixes.
      way, the same posture stop_gate.py takes -- with one recorded exception,
      check_unresolved_target: a mutating command whose target the shell decides asks
      rather than passing, because silence there is exactly the failure this hook exists
-     to prevent. This layer is unchanged.
+     to prevent. And one recorded refinement (Pete, 2026-10-13): checks on a
+     repo-changing command cut short by the time budget or a timed-out git call are
+     REPORTED in a systemMessage, without a decision -- silence there was identical to
+     "this command is fine" (docs/plan-guard-ship-time-budget-V0-1.md).
 
   2. A crash inside the hook now ASKS, but only when the payload looks risky.
      crash_document() re-scans the raw stdin text for CRASH_RECHECK_WORDS and emits an
@@ -109,6 +112,7 @@ Calibrated by hooks/guard_ship_selftest.py, run from CI.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shlex
@@ -123,8 +127,19 @@ GIT_TIMEOUT_SECONDS = 5
 
 # Total budget for the repo-state checks. Measured real cost (A11, #48): 8 git
 # subprocesses, +260-360 ms on a commit/checkout -b or merge onto a protected branch.
-# Overrunning means staying silent, never blocking.
+# Measured 2026-10-13 on Windows: ~0.55 s for the whole hook run on a commit onto main,
+# 1.6-9.6 s under heavy CPU contention. Overrunning -- or one git call timing out --
+# never blocks, but it is REPORTED (see incomplete_notice): silence here is identical to
+# "this command is fine", which is the one thing a give-up must not look like.
 WALL_CLOCK_BUDGET_SECONDS = 3.0
+
+# Replace WALL_CLOCK_BUDGET_SECONDS and GIT_TIMEOUT_SECONDS for one run, so a test can
+# judge the decision path without racing the clock on a loaded machine. The budget may be
+# 0, to drive the give-up path on purpose; the git timeout may not. Nothing in the
+# harness sets either. An unusable value is ignored and the default applies. Setting the
+# budget to 0 cannot quietly switch the checks off: it produces the give-up notice.
+BUDGET_OVERRIDE_ENV = "GUARD_SHIP_BUDGET_SECONDS"
+GIT_TIMEOUT_OVERRIDE_ENV = "GUARD_SHIP_GIT_TIMEOUT_SECONDS"
 
 # Read from the target repo, not from this one: a cross-repo command should be judged by
 # the conventions of the repo it lands in. Same file stop_gate.py reads, so a project that
@@ -327,7 +342,42 @@ def same_path(left: str | None, right: str | None) -> bool:
     )
 
 
+# ----------------------------------------------------------------- time limits
+
+
+def seconds_override(name: str, default: float, *, allow_zero: bool) -> float:
+    """A time limit from the environment variable `name`, or `default` when it is unset,
+    not a number, not finite, negative, or zero where zero is not allowed."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    if not math.isfinite(value) or value < 0 or (value == 0 and not allow_zero):
+        return default
+    return value
+
+
+def wall_clock_budget() -> float:
+    """Seconds this run may spend on its repo-state checks. See BUDGET_OVERRIDE_ENV."""
+    return seconds_override(BUDGET_OVERRIDE_ENV, WALL_CLOCK_BUDGET_SECONDS, allow_zero=True)
+
+
+def git_timeout() -> float:
+    """Seconds one git call may take. See GIT_TIMEOUT_OVERRIDE_ENV."""
+    return seconds_override(GIT_TIMEOUT_OVERRIDE_ENV, GIT_TIMEOUT_SECONDS, allow_zero=False)
+
+
 # --------------------------------------------------------------------------- git
+
+
+# The git calls that outlived git_timeout() during the current repo_reasons() run, as the
+# argument lists that timed out. Module state because git() is reached from a dozen
+# helpers that have no other channel back to repo_reasons(); repo_reasons() empties it on
+# entry, so a self-test that calls evaluate() many times in one process sees no carry-over.
+TIMED_OUT_GIT_CALLS: list[tuple[str, ...]] = []
 
 
 def git(directory: str, *args: str) -> tuple[int, str]:
@@ -335,8 +385,10 @@ def git(directory: str, *args: str) -> tuple[int, str]:
 
     Never raises. Unlike stop_gate.py's equivalent -- which raises so that a broken gate
     can announce itself -- this hook is a confirmation prompt in front of every Bash
-    command, so a missing git binary or a hung filesystem must degrade to silence rather
-    than to noise on every call. A non-zero code is the caller's signal to stop.
+    command, so a missing git binary must degrade to silence rather than to noise on every
+    call. A non-zero code is the caller's signal to stop. A TIMEOUT is the exception that
+    is also recorded (TIMED_OUT_GIT_CALLS): a check that stopped for want of time has not
+    judged the command, and repo_reasons() says so rather than passing it off as fine.
     """
     try:
         proc = subprocess.run(
@@ -345,8 +397,11 @@ def git(directory: str, *args: str) -> tuple[int, str]:
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=GIT_TIMEOUT_SECONDS,
+            timeout=git_timeout(),
         )
+    except subprocess.TimeoutExpired:
+        TIMED_OUT_GIT_CALLS.append(args)
+        return 1, ""
     except (OSError, subprocess.SubprocessError):
         return 1, ""
     return proc.returncode, (proc.stdout or "").strip()
@@ -1149,24 +1204,51 @@ REPO_CHECKS = (
 )
 
 
-def repo_reasons(command: str, base_directory: str) -> list[str]:
-    """Every repo-state reason this command earns. Empty on anything unevaluable."""
-    if "git" not in command:
-        return []  # the overwhelmingly common case: no subprocess, no cost
+def incomplete_notice(cause: str) -> str:
+    """What the user is told when the checks on a repo-changing command did not finish."""
+    return (
+        f"Ship guard: {cause}, so it did not finish checking this command. Not asking -- "
+        "but nothing has confirmed the command is safe: check which branch and which "
+        "checkout it lands in."
+    )
 
-    deadline = time.monotonic() + WALL_CLOCK_BUDGET_SECONDS
+
+def repo_reasons(command: str, base_directory: str) -> tuple[list[str], str | None]:
+    """Every repo-state reason this command earns, plus a notice when its checks on a
+    repo-changing invocation did not all finish -- the budget ran out, or a git call
+    timed out. Reasons stay empty on anything unevaluable; the notice is what stops
+    that silence reading as "fine" when the checks were cut short rather than satisfied.
+
+    The notice is limited to commands with a repo-changing invocation because no check
+    here fires on any other (each is gated on `_is_mutating`'s cases), so a cut-short
+    `git status` has lost nothing -- the same rule check_unresolved_target follows.
+    """
+    if "git" not in command:
+        return [], None  # the overwhelmingly common case: no subprocess, no cost
+
+    TIMED_OUT_GIT_CALLS.clear()
+    budget = wall_clock_budget()
+    deadline = time.monotonic() + budget
     session = Session(base_directory)
     reasons: list[str] = []
+    invocations = parse_git_invocations(command, base_directory)
 
-    for invocation in parse_git_invocations(command, base_directory):
+    for position, invocation in enumerate(invocations):
         for check in REPO_CHECKS:
-            if time.monotonic() > deadline:
-                return reasons
+            # `>=`, not `>`: on a coarse clock a 0 s budget must still give up, not run.
+            if time.monotonic() >= deadline:
+                unjudged = invocations[position:]
+                if any(_is_mutating(each) for each in unjudged):
+                    return reasons, incomplete_notice(f"gave up after {budget:g}s")
+                return reasons, None
             reason = check(invocation, session)
             if reason and reason not in reasons:
                 reasons.append(reason)
 
-    return reasons
+    if TIMED_OUT_GIT_CALLS and any(_is_mutating(each) for each in invocations):
+        stalled = " ".join(TIMED_OUT_GIT_CALLS[0])
+        return reasons, incomplete_notice(f"`git {stalled}` timed out after {git_timeout():g}s")
+    return reasons, None
 
 
 # ----------------------------------------------------------------- entry point
@@ -1216,16 +1298,21 @@ def evaluate(payload: dict) -> dict | None:
     base_directory = (
         payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     )
+    notice: str | None = None
     if isinstance(base_directory, str) and base_directory:
-        reasons.extend(repo_reasons(command, base_directory))
+        found, notice = repo_reasons(command, base_directory)
+        reasons.extend(found)
 
     if not reasons:
-        return None
+        # Checks cut short with nothing found: say so, without a decision -- Pete,
+        # 2026-10-13: a visible warning, not a block (docs/plan-guard-ship-time-budget-V0-1.md).
+        return {"systemMessage": notice} if notice else None
 
     # One prompt carrying every reason, rather than the first one winning: a command that
     # commits onto main in someone else's primary checkout has two separate problems, and
-    # fixing only the one it happened to mention would be worse than useless.
-    return _ask("\n\n".join(reasons))
+    # fixing only the one it happened to mention would be worse than useless. A notice
+    # rides along: running out of time never downgrades an ask already earned.
+    return _ask("\n\n".join([*reasons, notice] if notice else reasons))
 
 
 # The literal strings that make a crashed-on payload worth speaking up about. Substrings,
