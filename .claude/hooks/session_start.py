@@ -67,6 +67,11 @@ checkout was a merge behind and nothing had fetched since. `commits_behind_origi
 warning naming how many commits behind the checkout is. Silence here (no `origin`, offline,
 `git` missing) is the common case, not a warning on its own -- only "checked and found
 behind" is.
+
+SF1: SIDEBAR FILING. The fourth opening check tells the session which desktop-app sidebar
+section to file itself under, named after the project's primary checkout folder
+(`project_name`). The hook names the section and the session does the filing, because a
+hook cannot call an MCP tool. Plan: docs/sf1-sidebar-filing-plan-V0-1.md.
 """
 
 from __future__ import annotations
@@ -108,6 +113,8 @@ remote-controlled.
 3. RESUME STATE. If this project has a resume-state memory file, read it before \
 planning anything, so you start from the last session's hand-off rather than \
 re-deriving it.
+
+{_sidebar_line(repo_root)}
 
 Then, for the work itself:
 
@@ -201,6 +208,66 @@ def _branch_line(repo_root: str | None) -> str:
         "or concurrent session. Do not add commits onto it for a new work unit; branch "
         "off `main` instead (in a separate `git worktree` if another session might "
         "still be using this checkout)."
+    )
+
+
+# ------------------------------------------------------------------------ sidebar
+
+
+def project_name(repo_root: str | None) -> str | None:
+    """The project this checkout belongs to: the folder name of its PRIMARY checkout, or
+    None if git cannot say.
+
+    SF1: the desktop app's sidebar has one manual section per project, named exactly after
+    the project folder. A worktree (`<repo>/.claude/worktrees/x`, or a sibling such as
+    `web-auditor-worktrees/phase-2`) must file under its parent, and its own folder name is
+    not that. Every worktree shares the primary checkout's `.git` as its common dir, so the
+    parent of `--git-common-dir` is the primary checkout wherever the worktree sits. A
+    common dir not named `.git` (a bare repo, a submodule's `.git/modules/<name>`) has no
+    primary folder to name, so the answer is None rather than a guess."""
+    if not repo_root:
+        return None
+    try:
+        proc = subprocess.run(
+            ["git", "-C", repo_root, "rev-parse", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=GH_TIMEOUT_SECONDS,
+        )
+    except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+        return None
+    out = (proc.stdout or "").strip()
+    if proc.returncode != 0 or not out:
+        return None
+    # Relative output (".git" in a primary checkout) is relative to the -C directory.
+    common_dir = os.path.normpath(os.path.join(repo_root, out))
+    if os.path.basename(common_dir) != ".git":
+        return None
+    return os.path.basename(os.path.dirname(common_dir)) or None
+
+
+def _sidebar_line(repo_root: str | None) -> str:
+    name = project_name(repo_root)
+    if name is None:
+        return (
+            "4. SIDEBAR. Could not work out this project's name automatically, so do not "
+            "file this session into a sidebar section."
+        )
+    # json.dumps quotes the name unambiguously, so a folder name with spaces or quotes
+    # cannot be misread as several words or run into the surrounding prose.
+    quoted = json.dumps(name, ensure_ascii=False)
+    return (
+        f"4. SIDEBAR. File this session under the Code-tab sidebar section named exactly "
+        f"{quoted}, using the mcp__ccd_sidebar__* tools (load them with ToolSearch if "
+        "they are deferred): list_sections; if no section of kind \"manual\" has that "
+        "name, create_section with it and then set_view with that section_id and "
+        "group_by \"date\"; then move_sessions with session_ids [\"self\"] and that "
+        "section_id. Skip this silently if those tools are not available (VS Code, "
+        "claude.ai, a routine), or if the move is refused because this session is nested "
+        "under another one (it moves with its parent). Say nothing about it in the "
+        "preamble unless it failed for another reason."
     )
 
 
@@ -484,9 +551,13 @@ def render_distribution_section(repo_root: str) -> str:
 
     if failures:
         lines.append("")
+        # A36: these failures come from --verify, which CI does not run (it runs the plain,
+        # offline check), so CI can be green while this is red. Saying "CI is red too"
+        # misled a planning brief on 2026-10-10.
         lines.append(
-            "REGISTER INCONSISTENT — scripts/check_distribution.py is red, so CI here is "
-            "red too. Fix it before re-seeding anything:"
+            "REGISTER INCONSISTENT — scripts/check_distribution.py --verify is red. CI runs "
+            "it without --verify, so CI here may still be green; do not read one as the "
+            "other. Fix it before re-seeding anything:"
         )
         lines.extend(f"- {failure.strip()}" for failure in failures)
 
