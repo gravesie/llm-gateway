@@ -39,7 +39,7 @@ Set `LLM_GATEWAY_COST_LOG` and every call appends a line like this:
  "status":"ok","measured":true,"model":"claude-haiku-4-5","provider":"anthropic",
  "input_tokens":1200,"output_tokens":340,"cache_read_tokens":8000,"cache_write_tokens":2000,
  "latency_ms":1843.2,"cost_usd":0.0062,"cost_gbp":0.00457,"pricing_source":"gateway_table",
- "pricing_checked":"2026-09-02","fx_rate_usd_per_gbp":1.3555,"fx_source":"default"}
+ "pricing_checked":"2026-09-02","fx_rate_usd_per_gbp":1.3330,"fx_source":"default"}
 ```
 
 Leave `LLM_GATEWAY_COST_LOG` unset and nothing is written. The call still works.

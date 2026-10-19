@@ -70,16 +70,24 @@ _LITELLM_SOURCE = (
     "https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json"
 )
 
-_CHECKED = "2026-09-07"
+_CHECKED = "2026-10-19"
+
+# Rows the 2026-10-19 sweep could NOT re-audit, because the vendor page no longer carries
+# them: Gemini's pricing page has no section for gemini-3.7-flash or gemini-3.5-flash. The
+# rates stay (litellm's catalogue still agrees, which is a cross-check, not a source) and
+# the date stays at the last time the page did carry them. Moving it would claim an audit
+# that did not happen.
+_GEMINI_UNLISTED_CHECKED = "2026-09-07"
 
 # relax.ai publishes one table, in pounds sterling, with input and output rates only: no
 # cached-input or cache-write rate, and no prompt-length tier. The raw page was read on
 # ``_RELAX_CHECKED`` and the currency confirmed from its bytes (U+00A3), not from a
 # rendered summary. The page does not say whether VAT is included. litellm has no relax.ai
 # entries, so unlike the table above there is no second catalogue to cross-check against;
-# the model ids were confirmed against a live ``GET /v1/models`` the same day.
+# the model ids were confirmed against a live ``GET /v1/models`` on 2026-09-29. The
+# 2026-10-19 re-read covered the pricing page only: all five rows unchanged, no new model.
 _RELAX_SOURCE = "https://relax.ai/docs/getting-started/pricing"
-_RELAX_CHECKED = "2026-09-29"
+_RELAX_CHECKED = "2026-10-19"
 
 # Model ids frequently carry a release-date suffix (claude-haiku-4-5-20251001,
 # gpt-4o-2024-08-06). Stripping exactly that suffix is safe; anything looser would let a
@@ -135,6 +143,8 @@ def _anthropic(
     output_rate: float,
     cache_write_rate: float,
     cache_read_rate: float,
+    *,
+    max_priced_prompt_tokens: int | None = None,
 ) -> ModelPrice:
     return ModelPrice(
         input_usd_per_mtok=input_rate,
@@ -144,6 +154,7 @@ def _anthropic(
         source_url=_ANTHROPIC_SOURCE,
         checked=_CHECKED,
         note="5-minute cache writes; 1-hour writes are 2x and are not priced here",
+        max_priced_prompt_tokens=max_priced_prompt_tokens,
     )
 
 
@@ -181,6 +192,7 @@ def _gemini(
     cache_read_rate: float | None,
     note: str | None = None,
     max_priced_prompt_tokens: int | None = None,
+    checked: str = _CHECKED,
 ) -> ModelPrice:
     return ModelPrice(
         input_usd_per_mtok=input_rate,
@@ -191,7 +203,7 @@ def _gemini(
         # unexpected cache-creation count refuses to price instead of pricing as free.
         cache_write_usd_per_mtok=None,
         source_url=_GEMINI_SOURCE,
-        checked=_CHECKED,
+        checked=checked,
         note=note,
         max_priced_prompt_tokens=max_priced_prompt_tokens,
     )
@@ -217,8 +229,14 @@ _PROMO = (
     "2026-12-31; all three double on 2027-01-01"
 )
 
+_ARGON_PROMO = (
+    "the page lists these input, output and cache-read rates as running through "
+    "2026-11-30 and exactly double from 2026-12-01 ($4 / $20 / $0.20); implicit caching only"
+)
+
 # Prompt-length thresholds above which the published rates change.
 _OPENAI_TIER = 272_000
+_HAIKU_5_5_TIER = 100_000
 _GEMINI_PRO_TIER = 200_000
 
 # Keys are bare model ids, lowercase, with any provider prefix already stripped.
@@ -228,6 +246,7 @@ PRICES: dict[str, ModelPrice] = {
     "claude-mythos-5-1": _anthropic(10.0, 50.0, 12.50, 0.25),
     "claude-fable-5": _anthropic(10.0, 50.0, 12.50, 1.0),
     "claude-mythos-5": _anthropic(10.0, 50.0, 12.50, 1.0),
+    "claude-opus-5-5": _anthropic(4.0, 20.0, 5.0, 0.20),
     "claude-opus-5": _anthropic(5.0, 25.0, 6.25, 0.50),
     "claude-opus-4-8": _anthropic(5.0, 25.0, 6.25, 0.50),
     "claude-opus-4-7": _anthropic(5.0, 25.0, 6.25, 0.50),
@@ -235,10 +254,16 @@ PRICES: dict[str, ModelPrice] = {
     "claude-opus-4-5": _anthropic(5.0, 25.0, 6.25, 0.50),
     "claude-opus-4-1": _anthropic(15.0, 75.0, 18.75, 1.50),
     "claude-opus-4": _anthropic(15.0, 75.0, 18.75, 1.50),
+    "claude-sonnet-5-5": _anthropic(2.0, 10.0, 2.50, 0.10),
     "claude-sonnet-5": _anthropic(2.0, 10.0, 2.50, 0.20),
     "claude-sonnet-4-6": _anthropic(3.0, 15.0, 3.75, 0.30),
     "claude-sonnet-4-5": _anthropic(3.0, 15.0, 3.75, 0.30),
     "claude-sonnet-4": _anthropic(3.0, 15.0, 3.75, 0.30),
+    # Haiku 5.5 is priced in two tiers by prompt length; this is the up-to-100k row, and a
+    # longer prompt ($0.50 in / $2.50 out) is reported as unpriced rather than billed low.
+    "claude-haiku-5-5": _anthropic(
+        0.10, 0.50, 0.125, 0.01, max_priced_prompt_tokens=_HAIKU_5_5_TIER
+    ),
     "claude-haiku-4-5": _anthropic(1.0, 5.0, 1.25, 0.10),
     "claude-haiku-3-5": _anthropic(0.80, 4.0, 1.0, 0.08),
     # --- OpenAI: input, cached input, output ---
@@ -247,6 +272,34 @@ PRICES: dict[str, ModelPrice] = {
     # long-context tier is separate and applies to every model below, including gpt-5.5
     # and gpt-5.4 — they publish it in the row label rather than as extra columns, which
     # is why it was missed here until the 2026-09-07 sweep.
+    "gpt-6-astra": _openai(
+        10.0,
+        1.0,
+        50.0,
+        cache_write_multiplier=1.25,
+        max_priced_prompt_tokens=_OPENAI_TIER,
+    ),
+    "gpt-6.1-sol": _openai(
+        2.0,
+        0.10,
+        10.0,
+        cache_write_multiplier=1.25,
+        max_priced_prompt_tokens=_OPENAI_TIER,
+    ),
+    "gpt-6-sol": _openai(
+        2.0,
+        0.20,
+        10.0,
+        cache_write_multiplier=1.25,
+        max_priced_prompt_tokens=_OPENAI_TIER,
+    ),
+    "gpt-6-luna": _openai(
+        0.10,
+        0.01,
+        0.50,
+        cache_write_multiplier=1.25,
+        max_priced_prompt_tokens=_OPENAI_TIER,
+    ),
     "gpt-5.6-sol": _openai(
         4.0,
         0.40,
@@ -287,10 +340,13 @@ PRICES: dict[str, ModelPrice] = {
     "o1": _openai(15.0, 7.50, 60.0, cache_write_multiplier=1.0),
     "gpt-3.5-turbo": _openai(0.50, None, 1.50, cache_write_multiplier=1.0),
     # --- Google Gemini: input, output, cache read ---
+    "gemini-4-argon": _gemini(2.0, 10.0, 0.10, _ARGON_PROMO),
     "gemini-3.8-flash": _gemini(0.75, 3.75, 0.075, _PROMO),
-    "gemini-3.7-flash": _gemini(0.75, 3.75, 0.075, _PROMO),
+    # Not on the pricing page on 2026-10-19; see ``_GEMINI_UNLISTED_CHECKED``.
+    "gemini-3.7-flash": _gemini(0.75, 3.75, 0.075, _PROMO, checked=_GEMINI_UNLISTED_CHECKED),
     "gemini-3.6-flash": _gemini(0.75, 3.75, 0.075, _PROMO),
-    "gemini-3.5-flash": _gemini(1.50, 9.0, 0.15),
+    "gemini-3.5-flash": _gemini(1.50, 9.0, 0.15, checked=_GEMINI_UNLISTED_CHECKED),
+    "gemini-3.5-flash-lite": _gemini(0.30, 2.50, 0.03),
     "gemini-2.5-flash": _gemini(0.30, 2.50, 0.03),
     "gemini-2.5-flash-lite": _gemini(0.10, 0.40, 0.01),
     "gemini-2.5-pro": _gemini(

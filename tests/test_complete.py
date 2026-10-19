@@ -49,7 +49,7 @@ class TestHappyPath:
         assert row["cache_read_tokens"] == 8000
         assert row["cache_write_tokens"] == 2000
         assert row["cost_usd"] == pytest.approx(0.0062)
-        assert row["cost_gbp"] == pytest.approx(0.0062 / 1.3555)
+        assert row["cost_gbp"] == pytest.approx(0.0062 / 1.3330)
         assert row["latency_ms"] >= 0
         assert row["timestamp"].endswith("+00:00")
         assert row["response_id"] == "chatcmpl-test-1"
@@ -59,7 +59,7 @@ class TestHappyPath:
         # second file to edit on every price sweep. Provenance itself is covered by
         # test_pricing.py::TestProvenance.
         assert row["pricing_checked"] == pricing._CHECKED
-        assert row["fx_rate_usd_per_gbp"] == 1.3555
+        assert row["fx_rate_usd_per_gbp"] == 1.3330
 
     def test_arguments_reach_litellm_untouched(
         self, cost_log_file, stub_completion, response_factory

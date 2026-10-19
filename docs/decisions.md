@@ -888,3 +888,55 @@ cost where one used to appear, and a new caveat value. No new field in the recor
 `status` value, which is the bar for moving the schema. `ModelPrice.currency` and
 `PriceLookup.unknown_endpoint` are new attributes with defaults, so existing constructors
 keep working.
+
+## 2026-10-19 — The October price sweep: five new model families, two rows the vendor dropped
+
+Twelve days overdue. `_CHECKED` moves to `2026-10-19` and `_RELAX_CHECKED` to `2026-10-19`.
+Method as in 2026-09-07: raw page, then `litellm.model_cost` (1.106.0) as the independent
+cross-check. Every existing Anthropic, OpenAI and relax.ai rate matched its page and litellm
+on every column. **No existing rate changed.**
+
+**Added, all four sources agreeing (page and litellm):** `claude-opus-5-5` ($4 / $20,
+cache read $0.20), `claude-sonnet-5-5` ($2 / $10, cache read $0.10), `claude-haiku-5-5`
+($0.10 / $0.50, with a 100k-token tier above which input is $0.50 and output $2.50, carried
+as `max_priced_prompt_tokens`), `gpt-6-astra`, `gpt-6.1-sol`, `gpt-6-sol`, `gpt-6-luna`
+(all with the 272k tier and 1.25x cache writes), `gemini-3.5-flash-lite`, `gemini-4-argon`.
+Before this change they priced through litellm's fallback at `checked=None`.
+
+**Two traps in the new rows.** Opus 5.5 and Sonnet 5.5 cache hits are 0.05x input, not the
+0.1x every other model uses, so Sonnet 5.5's cache read ($0.10) is *lower* than Sonnet 5's
+($0.20) despite the same input rate. `gpt-6.1-sol` and `gpt-6-sol` share input and output
+rates and differ only in cache read ($0.10 vs $0.20). Both are tested by name.
+
+**`gemini-4-argon` has a hard date: its rates double on 2026-12-01** ($2/$10/$0.10 become
+$4/$20/$0.20), not 2027-01-01 like the Flash models. The page does not call it
+promotional, only dated. litellm carries the current rate and no step. The note on the row
+says so. **The next checkpoint is before 2026-11-30**, earlier than the Flash one.
+
+**Defect (provenance, not a number): `gemini-3.7-flash` and `gemini-3.5-flash` are no longer
+on Gemini's pricing page** (27 model sections read; neither is one). litellm still lists
+both at the old rates. The rates are left as they were and their `checked` stays
+`2026-09-07`; moving the date would assert an audit that could not happen. `_gemini` gained
+a `checked` argument for this, and the provenance test names the two rows so that a third
+cannot slip through unnoticed. Whether those models are retired or merely unlisted is not
+determinable from the page. Treat their rates as unverified, and re-check when either is
+used for real work.
+
+**Confirmed unchanged:** Gemini 3.8 / 3.6 Flash promo ($0.75 / $3.75 / $0.075 through
+2026-12-31, doubling 2027-01-01); Gemini 2.5 Pro / Flash / Flash-Lite; relax.ai (all five
+rows identical, £ confirmed, VAT still unstated). The relax model ids were *not* re-checked
+against live `/v1/models` this time (no key in this session); only the page was re-read.
+
+**FX moved: 1.3555 to 1.3330 USD/GBP (H.10 release 2026-10-19, rate for 2026-10-16,
+confirmed in the raw page).** The default has always been the latest published observation,
+so it moves. Effect: every USD-priced call now reports about 1.7% more in GBP than before.
+`DEFAULT_RATE_DATE` and four test literals followed.
+
+**Still not in the table, deliberately:** `gpt-5.4-mini`, `gpt-5.4-nano`, `gpt-5.5-pro`,
+`gpt-5.4-pro`, `gemini-3.1-pro-preview`, `gemini-3.1-flash-lite`, `gemini-3-flash-preview`
+and others price through litellm's fallback. They are not new launches, and adding each
+needs the page read per row; do it when a consumer uses one.
+
+**Version:** this changes observable output (new models priced from the table, and GBP
+figures from the new FX default), so it merits a patch or minor release. Not tagged here.
+
