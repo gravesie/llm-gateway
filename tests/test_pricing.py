@@ -163,7 +163,17 @@ class TestLongContextTiers:
 
     @pytest.mark.parametrize(
         "model",
-        ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4"],
+        [
+            "gpt-6-astra",
+            "gpt-6.1-sol",
+            "gpt-6-sol",
+            "gpt-6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.5",
+            "gpt-5.4",
+        ],
     )
     def test_every_openai_model_with_a_published_long_tier_carries_it(self, model):
         """gpt-5.5 and gpt-5.4 shipped without this and were billed at the low tier.
@@ -201,11 +211,103 @@ class TestLongContextTiers:
         assert pricing.long_context_tier_exceeded(price, 272_001)
 
 
+# Rows the vendor page no longer carries, so the latest sweep could not re-audit them and
+# their date must stay at the last audit. Adding a name here is a deliberate statement that
+# a rate is unverified; do it only when the page genuinely has no row.
+UNLISTED_ON_VENDOR_PAGE = {"gemini-3.7-flash", "gemini-3.5-flash"}
+
+
+class TestNewModels2026_10:
+    """Rates added by the 2026-10-19 sweep, each read from the vendor page and agreeing
+    with litellm's independent catalogue (the cross-check test below compares them)."""
+
+    @pytest.mark.parametrize(
+        ("model", "rates"),
+        [
+            ("claude-opus-5-5", (4.0, 20.0, 5.0, 0.20)),
+            ("claude-sonnet-5-5", (2.0, 10.0, 2.50, 0.10)),
+            ("claude-haiku-5-5", (0.10, 0.50, 0.125, 0.01)),
+        ],
+    )
+    def test_anthropic_5_5_rates_come_from_the_table(self, model, rates):
+        lookup = pricing.look_up_price(model)
+        assert lookup.source == "gateway_table"
+        price = lookup.price
+        assert (
+            price.input_usd_per_mtok,
+            price.output_usd_per_mtok,
+            price.cache_write_usd_per_mtok,
+            price.cache_read_usd_per_mtok,
+        ) == rates
+
+    def test_5_5_cache_reads_are_not_the_older_models_multiplier(self):
+        """Opus 5.5 / Sonnet 5.5 cache hits are 0.05x input, not the usual 0.1x."""
+        assert pricing.PRICES["claude-sonnet-5-5"].cache_read_usd_per_mtok == 0.10
+        assert pricing.PRICES["claude-sonnet-5"].cache_read_usd_per_mtok == 0.20
+
+    def test_haiku_5_5_refuses_to_price_past_100k_prompt_tokens(self):
+        price = pricing.PRICES["claude-haiku-5-5"]
+        assert price.max_priced_prompt_tokens == 100_000
+        assert not pricing.long_context_tier_exceeded(price, 100_000)
+        assert pricing.long_context_tier_exceeded(price, 100_001)
+
+    @pytest.mark.parametrize(
+        ("model", "rates"),
+        [
+            ("gpt-6-astra", (10.0, 1.0, 50.0, 12.5)),
+            ("gpt-6.1-sol", (2.0, 0.10, 10.0, 2.5)),
+            ("gpt-6-sol", (2.0, 0.20, 10.0, 2.5)),
+            ("gpt-6-luna", (0.10, 0.01, 0.50, 0.125)),
+        ],
+    )
+    def test_gpt_6_rates_come_from_the_table(self, model, rates):
+        lookup = pricing.look_up_price(model)
+        assert lookup.source == "gateway_table"
+        price = lookup.price
+        assert (
+            price.input_usd_per_mtok,
+            price.cache_read_usd_per_mtok,
+            price.output_usd_per_mtok,
+            price.cache_write_usd_per_mtok,
+        ) == rates
+
+    @pytest.mark.parametrize(
+        ("model", "rates"),
+        [
+            ("gemini-4-argon", (2.0, 10.0, 0.10)),
+            ("gemini-3.5-flash-lite", (0.30, 2.50, 0.03)),
+        ],
+    )
+    def test_new_gemini_rates_come_from_the_table(self, model, rates):
+        lookup = pricing.look_up_price(model)
+        assert lookup.source == "gateway_table"
+        assert lookup.price.checked == pricing._CHECKED
+        price = lookup.price
+        assert (
+            price.input_usd_per_mtok,
+            price.output_usd_per_mtok,
+            price.cache_read_usd_per_mtok,
+        ) == rates
+
+    def test_gemini_4_argon_note_carries_the_december_doubling(self):
+        note = pricing.PRICES["gemini-4-argon"].note
+        assert "2026-11-30" in note and "2026-12-01" in note
+
+    def test_the_flash_promo_note_still_says_it_doubles_on_2027_01_01(self):
+        for name in ("gemini-3.8-flash", "gemini-3.6-flash"):
+            assert "2027-01-01" in pricing.PRICES[name].note, name
+
+
 class TestProvenance:
     def test_every_rate_carries_a_source_and_a_date(self):
         for name, price in pricing.PRICES.items():
             assert price.source_url.startswith("https://"), name
-            assert price.checked == "2026-09-07", name
+            expected = (
+                pricing._GEMINI_UNLISTED_CHECKED
+                if name in UNLISTED_ON_VENDOR_PAGE
+                else pricing._CHECKED
+            )
+            assert price.checked == expected, name
 
     def test_the_table_agrees_with_litellms_independent_catalogue(self):
         """Cross-check against a second source to catch transcription errors.

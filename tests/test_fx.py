@@ -53,4 +53,4 @@ class TestConversion:
 
     def test_the_documented_default_matches_its_recorded_source(self):
         assert fx.DEFAULT_SOURCE_URL.startswith("https://www.federalreserve.gov/")
-        assert fx.DEFAULT_RATE_DATE == "2026-08-28"
+        assert fx.DEFAULT_RATE_DATE == "2026-10-16"

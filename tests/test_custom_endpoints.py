@@ -4,7 +4,7 @@ relax.ai is the case that forced this. It serves open-weight models through an
 OpenAI-compatible API, so litellm reaches it as ``openai/<model>`` with an ``api_base``.
 Priced by name alone, such a call was labelled ``openai`` and, for ``DeepSeek-V4-Pro``,
 billed at DeepSeek's own dollar rate from litellm's catalogue. Confirmed live on
-2026-09-29 before this was fixed; see ``docs/decisions.md``.
+2026-10-19 before this was fixed; see ``docs/decisions.md``.
 """
 
 from __future__ import annotations
@@ -177,7 +177,7 @@ class TestCurrency:
             cache_read_usd_per_mtok=None,
             cache_write_usd_per_mtok=None,
             source_url="https://example.com",
-            checked="2026-09-29",
+            checked="2026-10-19",
             currency="EUR",
         )
         assert pricing.costs_usd_and_gbp(price, usd_per_gbp=1.25, **TOKENS) == (None, None)
@@ -205,7 +205,7 @@ class TestRelaxProvenance:
     def test_every_relax_rate_carries_a_source_a_date_and_its_currency(self):
         for name, price in pricing.RELAX_PRICES.items():
             assert price.source_url.startswith("https://relax.ai/"), name
-            assert price.checked == "2026-09-29", name
+            assert price.checked == "2026-10-19", name
             assert price.currency == "GBP", name
 
     def test_every_rate_in_the_ordinary_table_is_in_dollars(self):
@@ -230,7 +230,7 @@ class TestRecord:
         assert row["provider"] == "relax"
         assert row["model_priced_as"] == "deepseek-v4-pro"
         assert row["pricing_source"] == "gateway_table"
-        assert row["pricing_checked"] == "2026-09-29"
+        assert row["pricing_checked"] == "2026-10-19"
         assert row["pricing_caveat"] is None
         assert row["cost_gbp"] == pytest.approx(expected_gbp)
         assert row["cost_usd"] == pytest.approx(expected_gbp * row["fx_rate_usd_per_gbp"])
@@ -326,7 +326,7 @@ class TestRecord:
 
         assert row["provider"] == "anthropic"
         assert row["cost_usd"] == pytest.approx(0.0062)
-        assert row["cost_gbp"] == pytest.approx(0.0062 / 1.3555)
+        assert row["cost_gbp"] == pytest.approx(0.0062 / 1.3330)
 
 
 class TestCeilingsAndLadders:
