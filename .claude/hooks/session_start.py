@@ -127,7 +127,8 @@ schema, auth, payments or deploy. Single-file, clearly-scoped changes do not nee
 any code. A session can end without warning — credit exhaustion has ended three — and \
 wrap-session never runs, so anything held only in the conversation is lost. Plan mode's \
 file under ~/.claude/plans/ does not count: it is outside the repo, so a fresh checkout \
-and a claude.ai session cannot see it.
+and a claude.ai session cannot see it. After committing and pushing it, stop: offer a \
+fresh Sonnet session to build it (or print its opening message), unless Pete declines.
 - The escalation list in CLAUDE.md governs what you do unattended and what stops and \
 asks. Follow it literally rather than judging importance case by case.
 - Merging to main is the deploy. Never SSH to production to deploy. Merging requires an \
