@@ -333,10 +333,38 @@ def _match_from(pattern: list[str], entry: list[str], is_dir: bool) -> bool:
     return len(pattern) == len(entry) or (is_dir and len(pattern) > len(entry))
 
 
+def _could_end_with(part: str, ext: str) -> bool:
+    """Whether a glob name part could match a name that ends with `ext` (and is longer)."""
+    if not any(ch in part for ch in "*?["):
+        return part.endswith(ext) and len(part) > len(ext)
+    tail = part[max(part.rfind(ch) for ch in "*?[]") + 1 :]
+    return tail == "" or tail.endswith(ext) or ext.endswith(tail)
+
+
+def _could_reach_flat(pattern_parts: list[str], dir_parts: list[str], ext: str) -> bool:
+    """Whether a pattern could name a file directly in `dir_parts` ending with `ext`."""
+    for index, part in enumerate(dir_parts):
+        if index >= len(pattern_parts):
+            return False
+        if pattern_parts[index] == "**":
+            rest = pattern_parts[index + 1 :]
+            return not rest or _could_end_with(rest[-1], ext)
+        if not fnmatchcase(part, pattern_parts[index]):
+            return False
+    if len(pattern_parts) == len(dir_parts) + 1:
+        return pattern_parts[-1] == "**" or _could_end_with(pattern_parts[-1], ext)
+    if len(pattern_parts) > len(dir_parts) + 1 and pattern_parts[len(dir_parts)] == "**":
+        return _could_end_with(pattern_parts[-1], ext)
+    return False
+
+
 def could_reach(pattern: str, anywhere: bool, entry) -> bool:
     """Whether a glob-style `pattern` could name `entry`, or anything under it if a dir."""
     pattern_parts = _components(pattern)
     entry_parts = entry.path.split("/")
+    if entry.ext is not None:
+        starts = range(len(entry_parts) + 1) if anywhere else [0]
+        return any(_could_reach_flat(pattern_parts, entry_parts[s:], entry.ext) for s in starts)
     starts = range(len(entry_parts)) if anywhere else [0]
     if any(_match_from(pattern_parts, entry_parts[s:], entry.is_dir) for s in starts):
         return True
@@ -346,9 +374,20 @@ def could_reach(pattern: str, anywhere: bool, entry) -> bool:
     )
 
 
-def _names_entry(value: str, entry) -> bool:
+def _names_entry(value: str, entry, excepted: frozenset[str] = frozenset()) -> bool:
+    if entry.ext is not None:
+        wanted = entry.path.split("/")
+        parts = _components(value)
+        for i in range(len(parts) - len(wanted)):
+            name = parts[i + len(wanted)]
+            if parts[i : i + len(wanted)] != wanted or not name.endswith(entry.ext):
+                continue
+            candidate = "/".join(parts[i : i + len(wanted) + 1])
+            if len(name) > len(entry.ext) and candidate not in excepted:
+                return True
+        return False
     if not entry.is_dir:
-        return entry.path.rsplit("/", 1)[-1] in value
+        return entry.path not in excepted and entry.path.rsplit("/", 1)[-1] in value
     wanted = entry.path.split("/")
     parts = _components(value)
     return any(parts[i : i + len(wanted)] == wanted for i in range(len(parts)))
@@ -444,9 +483,9 @@ def _flags(tree: ast.AST, entries) -> list[tuple[int, str]]:
         line = getattr(node, "lineno", 0)
         if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in skip:
             flags += [
-                (line, f"names {entry.path}{'/**' if entry.is_dir else ''}")
+                (line, f"names {entry}")
                 for entry in entries
-                if _names_entry(node.value, entry)
+                if _names_entry(node.value, entry, entries.excepted)
             ]
         if not isinstance(node, ast.Call):
             continue
@@ -467,7 +506,7 @@ def _flags(tree: ast.AST, entries) -> list[tuple[int, str]]:
             flags += [
                 (
                     line,
-                    f"{kind} {pattern!r} could reach {entry.path}{'/**' if entry.is_dir else ''}",
+                    f"{kind} {pattern!r} could reach {entry}",
                 )
                 for entry in entries
                 if could_reach(pattern, anywhere, entry)
