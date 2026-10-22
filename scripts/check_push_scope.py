@@ -24,9 +24,16 @@ The list: `.claude/bookkeeping.json`
 -----------------------------------
     {"paths": [".claude/queue.json", "PETE-TODO.md"]}
 
-An entry is an exact repo-relative path, or `dir/**` (everything under `dir/`). Nothing
-else: any other wildcard, an absolute path, `..`, a backslash or an empty entry makes the
-whole file invalid, and an invalid file is "run the tests". A repo with no list never skips.
+An entry is an exact repo-relative path, `dir/**` (everything under `dir/`), or
+`dir/*.ext` (the files directly in `dir/` ending `.ext`, never nested; `dir` is required, so
+a bare `*.md` is invalid). Nothing else: any other wildcard, an absolute path, `..`, a
+backslash or an empty entry makes the whole file invalid, and an invalid file is "run the
+tests". A repo with no list never skips.
+
+An optional `"except"` list names exact paths that never count as bookkeeping, even when an
+entry matches them: `{"paths": ["docs/*.md"], "except": ["docs/roadmap.md"]}`. It takes
+exact paths only (no wildcard, no `/**`), and an invalid one invalidates the file. Any key
+other than `paths` and `except` does too.
 
 What counts as "changed", per ref line
 --------------------------------------
@@ -61,6 +68,9 @@ MAX_NAMED = 8
 _SHA = re.compile(r"^[0-9a-f]{40}([0-9a-f]{24})?$")
 _DRIVE = re.compile(r"^[A-Za-z]:")
 _WILDCARDS = "*?[]"
+# The one wildcard segment allowed besides a trailing `/**`: a star and a plain extension.
+_FLAT_NAME = re.compile(r"^\*\.[A-Za-z0-9]{1,10}$")
+_LIST_KEYS = {"paths", "except"}
 
 
 class ConfigError(Exception):
@@ -73,15 +83,31 @@ class Undecidable(Exception):
 
 @dataclass(frozen=True)
 class Entry:
-    """One list entry: an exact `path`, or, when `is_dir`, everything under it."""
+    """One list entry: an exact `path`; when `is_dir`, everything under it; when `ext` is
+    set (`.md`), the files directly in directory `path` that end with it."""
 
     path: str
     is_dir: bool
+    ext: str | None = None
 
     def matches(self, changed: str) -> bool:
+        if self.ext is not None:
+            parent, _, name = changed.rpartition("/")
+            return parent == self.path and name.endswith(self.ext) and len(name) > len(self.ext)
         if self.is_dir:
             return changed.startswith(self.path + "/")
         return changed == self.path
+
+    def __str__(self) -> str:
+        if self.ext is not None:
+            return f"{self.path}/*{self.ext}"
+        return f"{self.path}/**" if self.is_dir else self.path
+
+
+class EntryList(list):
+    """The list's entries, plus the exact paths its `except` list takes back out."""
+
+    excepted: frozenset[str] = frozenset()
 
 
 # ---- the list ------------------------------------------------------------------------
@@ -100,17 +126,31 @@ def parse_entry(raw: object) -> Entry:
 
     is_dir = raw.endswith("/**")
     path = raw[: -len("/**")] if is_dir else raw
+    ext = None
+    parent, _, last = raw.rpartition("/")
+    if not is_dir and parent and _FLAT_NAME.match(last):
+        path, ext = parent, last[1:]
     if not path:
         raise ConfigError(f"entry {raw!r} names no directory")
     for segment in path.split("/"):
         if segment in ("", ".", ".."):
             raise ConfigError(f"entry {raw!r} has an empty, '.' or '..' path segment")
         if any(ch in segment for ch in _WILDCARDS):
-            raise ConfigError(f"entry {raw!r} has a wildcard; only a trailing '/**' is allowed")
-    return Entry(path=path, is_dir=is_dir)
+            raise ConfigError(
+                f"entry {raw!r} has a wildcard; only a trailing '/**' or a final '*.ext' is allowed"
+            )
+    return Entry(path=path, is_dir=is_dir, ext=ext)
 
 
-def parse_list(text: str) -> list[Entry]:
+def parse_except(raw: object) -> str:
+    """One `except` path: an exact entry, nothing wider."""
+    entry = parse_entry(raw)
+    if entry.is_dir or entry.ext is not None:
+        raise ConfigError(f"except entry {raw!r} must be an exact path, not a wildcard")
+    return entry.path
+
+
+def parse_list(text: str) -> EntryList:
     """The entries in the text of a bookkeeping file, or ConfigError."""
     try:
         data = json.loads(text)
@@ -118,10 +158,18 @@ def parse_list(text: str) -> list[Entry]:
         raise ConfigError(f"not valid JSON: {error}") from error
     if not isinstance(data, dict) or not isinstance(data.get("paths"), list):
         raise ConfigError('expected an object with a "paths" list')
-    return [parse_entry(raw) for raw in data["paths"]]
+    unknown = sorted(set(data) - _LIST_KEYS)
+    if unknown:
+        raise ConfigError(f"unknown key {unknown[0]!r}; only 'paths' and 'except' are allowed")
+    excepted = data.get("except", [])
+    if not isinstance(excepted, list):
+        raise ConfigError('"except" must be a list of exact paths')
+    entries = EntryList(parse_entry(raw) for raw in data["paths"])
+    entries.excepted = frozenset(parse_except(raw) for raw in excepted)
+    return entries
 
 
-def load_list(root: Path) -> list[Entry] | None:
+def load_list(root: Path) -> EntryList | None:
     """The repo's entries, or None when it has no list (no skipping, ever)."""
     path = root / LIST_RELATIVE_PATH
     if not path.is_file():
@@ -132,7 +180,9 @@ def load_list(root: Path) -> list[Entry] | None:
         raise ConfigError(f"{LIST_RELATIVE_PATH.as_posix()}: {error}") from error
 
 
-def is_bookkeeping(changed: str, entries: list[Entry]) -> bool:
+def is_bookkeeping(changed: str, entries: EntryList) -> bool:
+    if changed in entries.excepted:
+        return False
     return any(entry.matches(changed) for entry in entries)
 
 
