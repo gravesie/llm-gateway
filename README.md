@@ -318,7 +318,7 @@ library is measurement-only for it today.
 ## Install
 
 ```
-pip install "llm-gateway @ git+https://github.com/gravesie/llm-gateway.git@v0.6.0"
+pip install "llm-gateway @ git+https://github.com/gravesie/llm-gateway.git@v0.6.1"
 ```
 
 Always a tag, never `main`. `DEPLOY.md` explains why.
