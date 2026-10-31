@@ -126,6 +126,7 @@ GIT_TIMEOUT_OVERRIDE_ENV = "TURN_GATE_GIT_TIMEOUT_SECONDS"
 # fnmatch's `*` spans `/`, so this one pattern also covers docs/workpackages/WP-x-plan.md
 # and anything else nested under docs/. Matching is case-insensitive.
 DEFAULT_PLAN_GLOBS = ("docs/*plan*.md",)
+QUEUE_PATH = ".claude/queue.json"
 
 # A recorded skip, not a silent one -- the posture SKIP_PREPUSH takes in the pre-push
 # hook. The reason stays in git history for as long as the commit does.
@@ -680,6 +681,74 @@ def branch_history(repo_root: str, base: str) -> list[tuple[str, int, list[str]]
     return history
 
 
+def queue_json_at(repo_root: str, rev: str) -> dict | None:
+    """The parsed `.claude/queue.json` at `rev`, or None when git cannot show a JSON object."""
+    code, text = git(repo_root, "show", f"{rev}:{QUEUE_PATH}")
+    if code != 0:
+        return None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def units_by_id(queue: dict) -> dict | None:
+    """Units keyed on `id`, or None when the list is malformed or an id repeats."""
+    units = queue.get("units")
+    if not isinstance(units, list):
+        return None
+    keyed = {}
+    for unit in units:
+        if not isinstance(unit, dict) or "id" not in unit or unit["id"] in keyed:
+            return None
+        keyed[unit["id"]] = unit
+    return keyed
+
+
+def queue_change_names_plan(repo_root: str, commit: str, plan_files: list[str]) -> bool:
+    """SG1: the commit's queue.json change is one unit's entry, and that entry names a plan.
+
+    True only when exactly one unit is added or changed, none is removed, every other
+    top-level key is untouched, and the changed entry's own text holds the path of a plan
+    file this commit adds. The entry is how a unit says which plan it belongs to. A parent
+    with no queue file reads as an empty queue; anything else git or json cannot read is
+    False, so the commit is judged by the ordinary rule.
+    """
+    after = queue_json_at(repo_root, commit)
+    if after is None:
+        return False
+    code, _ = git(repo_root, "cat-file", "-e", f"{commit}^:{QUEUE_PATH}")
+    before = queue_json_at(repo_root, f"{commit}^") if code == 0 else {"units": []}
+    if before is None:
+        return False
+    old_units, new_units = units_by_id(before), units_by_id(after)
+    if old_units is None or new_units is None:
+        return False
+    if set(old_units) - set(new_units):
+        return False
+    if {k: v for k, v in before.items() if k != "units"} != \
+            {k: v for k, v in after.items() if k != "units"}:
+        return False
+    changed = [uid for uid, unit in new_units.items() if old_units.get(uid) != unit]
+    if len(changed) != 1:
+        return False
+    entry_text = json.dumps(new_units[changed[0]]).lower()
+    return any(path.replace("\\", "/").lower() in entry_text for path in plan_files)
+
+
+def is_plan_commit(repo_root: str, commit: str, files: list[str],
+                   globs: tuple[str, ...]) -> bool:
+    """True when `commit` is the plan: only plan files, or SG1's plan plus its queue entry."""
+    plan_files = [path for path in files if is_plan_file(path, globs)]
+    if len(plan_files) == len(files):
+        return True
+    others = [path for path in files if not is_plan_file(path, globs)]
+    if not plan_files or [path.replace("\\", "/").lower() for path in others] != [QUEUE_PATH]:
+        return False
+    return queue_change_names_plan(repo_root, commit, plan_files)
+
+
 def not_the_plan(headline: str, files: list[str], globs: tuple[str, ...], fix: str) -> str:
     """The block message plan_first gives, whichever commit it is about."""
     listed_files = ", ".join(files[:5]) + ("…" if len(files) > 5 else "")
@@ -721,7 +790,7 @@ def continued_branch_verdict(repo_root: str, base: str, branch: str,
             continue
         if not files:  # a merge: nothing of its own to judge
             continue
-        if all(is_plan_file(path, globs) for path in files):
+        if is_plan_commit(repo_root, commit, files, globs):
             plan_seen = True
             continue
         if plan_seen or has_plan_exempt_trailer(repo_root, commit):
@@ -748,7 +817,9 @@ def check_plan_first(repo_root: str, config: dict, default_branch: str,
     for *multi-file* work), branches with nothing committed yet, and a first commit
     carrying a `Plan-exempt: <reason>` trailer. Also exempt: a branch whose work has
     already shipped (A38, see `work_has_shipped`). A branch an earlier session started is
-    judged on this session's commits only (A37, see `continued_branch_verdict`).
+    judged on this session's commits only (A37, see `continued_branch_verdict`). A plan
+    commit may also carry the one queue entry that queues its own unit (SG1, see
+    `is_plan_commit`).
     """
     branch = current_branch(repo_root)
     if branch is None or branch in resolve_protected_branches(config, default_branch):
@@ -797,7 +868,7 @@ def check_plan_first(repo_root: str, config: dict, default_branch: str,
 
     code, shown = git(repo_root, "show", "--name-only", "--format=", first)
     first_files = [line for line in shown.splitlines() if line.strip()]
-    if first_files and all(is_plan_file(path, globs) for path in first_files):
+    if first_files and is_plan_commit(repo_root, first, first_files, globs):
         return None
 
     return not_the_plan(
