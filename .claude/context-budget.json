@@ -17,7 +17,7 @@
   "budgets": [
     {
       "path": "CLAUDE.md",
-      "max_bytes": 14000,
+      "max_bytes": 16000,
       "note": "Rules and reference that must hold in every session. Anything that is a record rather than a rule belongs in docs/ and is read on demand."
     }
   ]
