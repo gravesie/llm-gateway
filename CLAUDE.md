@@ -72,6 +72,41 @@ recoverable — if it dies, `main` is clean and the intent is in git. It blocks 
 per stop-chain and then lets the turn end, so it is one recorded nudge, not a wall. It
 does not judge whether the code is correct; nothing deterministic can.
 
+## Talking to Pete
+
+Pete did not write the code. Anything addressed to him (a question, a decision, a
+blocker, a review verdict, a to-do item, a PR summary, a session hand-off) is written for
+one of two readers:
+- Technical issue: an experienced CIO who knows how the system is used in the
+  organisation, but not its internals.
+- Business issue: the business owner, non-technical, who cares about customers, sales,
+  cost and risk.
+
+Rules:
+- No function, file, variable, table, test or library names. No line numbers, no code.
+  Name things by what a user sees or does: "the sign-in email", "the approval screen",
+  "this morning's Cornwall post". The one exception is a file or folder Pete has to open:
+  see the next rule.
+- Any file or folder you point Pete to (because you think he should check it, read it or
+  give feedback on it), in a message, plan, table, summary or hand-off: give the full path
+  starting with `C:\`, on every mention, including each row of a table. Never a bare name,
+  slug or relative path, and never "24 drafts in four folders" without the paths. This
+  overrides the rule above, because Pete needs to open the file. When you tell him a file
+  has been created, the same applies.
+- Every item follows this shape, in this order:
+  1. What I need from you: the decision, yes/no or action, in one line.
+  2. What happens now: what a user sees or experiences today. Show an example if it helps.
+  3. If we make this change: what users will see that is different, and what it costs in
+     time or money.
+  4. If we don't: the concrete problem: who hits it, how likely it is, how bad it is.
+  5. My recommendation.
+- Technical detail (reproductions, line numbers, internal file paths) goes to whoever fixes
+  it, or into the PR description. It does not go in the message to Pete. Give it if he
+  asks. A file Pete must open is not internal detail: give its full path.
+- Never relay a subagent's report verbatim. Translate it into this shape first.
+- "Terse" means short, not technical. Keep every fact that bears on the decision; drop
+  the internals.
+
 ## Concurrent sessions
 
 One working tree per session — never run two sessions against the same checkout. Verify
@@ -92,6 +127,11 @@ state the understanding and approach in a sentence or two and go.
 - Tests: `python -m pytest` — the full suite. A red test is a real regression, not noise.
 - Lint: `python -m ruff check src tests` — must be clean.
 - No dev server, no port. This is a library, exercised through its test suite.
+- Local ports: before giving or writing any command, config or doc that names a local port
+  (the dev server, a database connection, or a port a container publishes), read it from `PORTS.md` on the dev-process repo's origin/main (`git show origin/main:PORTS.md`
+  if the checkout is behind). Never quote a port from memory or from a project file alone. If
+  this project's config disagrees with `PORTS.md`, say so. Never pick or change a port here
+  without editing that file first. Record: `docs/doctrine/local-ports.md` (dev-process).
 - After changing the package, reinstall it in the venv (`pip install -e .`) before
   running anything that imports it. A stale install is this project's version of a
   stale dev server.
