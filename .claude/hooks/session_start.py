@@ -132,7 +132,7 @@ fresh Sonnet session to build it (or print its opening message), unless Pete dec
 - The escalation list in CLAUDE.md governs what you do unattended and what stops and \
 asks. Follow it literally rather than judging importance case by case.
 - Merging to main is the deploy. Never SSH to production to deploy. Merging requires an \
-explicit go from Pete in this session.
+explicit go from Pete in this session, unless the Flow check says Flow.
 """
 
 
