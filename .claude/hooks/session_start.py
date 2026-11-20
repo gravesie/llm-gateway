@@ -129,10 +129,11 @@ wrap-session never runs, so anything held only in the conversation is lost. Plan
 file under ~/.claude/plans/ does not count: it is outside the repo, so a fresh checkout \
 and a claude.ai session cannot see it. After committing and pushing it, stop: offer a \
 fresh Sonnet session to build it (or print its opening message), unless Pete declines.
-- The escalation list in CLAUDE.md governs what you do unattended and what stops and \
-asks. Follow it literally rather than judging importance case by case.
+- The escalation list (`.claude/rules/dev-process.md`, or CLAUDE.md where a project has not \
+taken that file) governs what you do unattended and what stops and asks. Follow it \
+literally rather than judging importance case by case.
 - Merging to main is the deploy. Never SSH to production to deploy. Merging requires an \
-explicit go from Pete in this session.
+explicit go from Pete in this session, unless the Flow check says Flow.
 """
 
 

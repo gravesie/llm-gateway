@@ -60,6 +60,12 @@ THREE KINDS OF CHECK LIVE HERE.
     command aimed at a repository other than this session's own is the entire point of
     this layer -- pinning it to `hook_directory()` would make it blind to exactly that.
 
+THE ONE RELAXATION (AP3). A merge -- `gh pr merge` or the MCP merge tool -- earns a note
+instead of an ask when the repo it lands in has Flow on for sessions in its own
+`origin/main:.claude/autonomy.json`. Everything else still asks. Any doubt asks: see the
+"Flow merge" section below for the full list and its recorded limits. This is the only
+place the hook ever lowers an ask it would otherwise have given.
+
 WHY THIS FILE AND NOT stop_gate.py. The Stop hook fires after the turn, sees only the one
 directory the shell happens to be sitting in at that instant, and cannot undo a commit
 that has already landed. This hook fires *before* the command runs, on the command text
@@ -193,12 +199,14 @@ SUBSTITUTION_PLACEHOLDER = "$[substitution]"
 # calibration run against #28, not by the self-tests, which used no `+` refspec at all.
 # Both arms now cover it -- the `+` strip in check_push, and the alternation below -- and
 # cases 33-38 hold it there.
+MERGE_TEXT_PATTERN = re.compile(r"\bgh\s+pr\s+merge\b")
+MERGE_REASON = (
+    "Merging to main deploys to production. This needs an explicit go from Pete in "
+    "this session -- a green test suite on its own is not authorisation."
+)
+
 GUARDED = [
-    (
-        re.compile(r"\bgh\s+pr\s+merge\b"),
-        "Merging to main deploys to production. This needs an explicit go from Pete in "
-        "this session -- a green test suite on its own is not authorisation.",
-    ),
+    (MERGE_TEXT_PATTERN, MERGE_REASON),
     (
         # `\s\+\S` is the `+<refspec>` force shorthand, which reaches what the flags do
         # not: `git push origin +feature` rewrites history on a branch check_push has no
@@ -225,10 +233,15 @@ GUARDED = [
 ]
 
 
-def find_reason(command: str) -> str | None:
-    """Return the reason to prompt on for the text patterns, or None if unguarded."""
+def find_reason(command: str, excluding: tuple[str, ...] = ()) -> str | None:
+    """Return the reason to prompt on for the text patterns, or None if unguarded.
+
+    `excluding` skips reasons already settled elsewhere (a merge the Flow switch allows),
+    so a second guarded action in the same command -- a force-push after the merge -- still
+    gets its own ask instead of being hidden behind the first match.
+    """
     for pattern, reason in GUARDED:
-        if pattern.search(command):
+        if reason not in excluding and pattern.search(command):
             return reason
     return None
 
@@ -712,26 +725,31 @@ def _join_directory(
     return os.path.abspath(os.path.join(base or "", expanded))
 
 
-def parse_git_invocations(command: str, base_directory: str) -> list[GitInvocation]:
-    """Every `git <subcommand>` in `command`, each tagged with where it will run.
+def iter_command_segments(command: str, base_directory: str):
+    """Yield (words, directory, unresolved_word, variables) for each real command in `command`.
 
-    Segments are walked in order so that a `cd` in one applies to the git calls after it,
+    Segments are walked in order so that a `cd` in one applies to the commands after it,
     which is how every cross-repo command in the incident this hook answers was written.
     Once a `cd` goes somewhere the shell decides, the directory stays unknown until a
-    later `cd` names an absolute path again.
+    later `cd` names an absolute path again. `NAME=value` segments and `cd` segments are
+    consumed here and never yielded. `variables` is the live mapping: use it before asking
+    the generator for the next segment.
+
+    Shared by the git checks (parse_git_invocations) and the Flow-merge check
+    (parse_gh_merges), so both read a `cd` the same way.
     """
-    invocations: list[GitInvocation] = []
     shell_directory: str | None = base_directory
     unresolved_word: str | None = None
     variables: dict[str, str] = {}
     segment: list[str] = []
 
-    def flush() -> None:
+    def settle():
+        """The segment as a yield tuple, or None when it only changed shell state."""
         nonlocal shell_directory, unresolved_word
         if not segment:
-            return
+            return None
         if _record_assignments(segment, variables):
-            return
+            return None
         if segment[0] == "cd" and len(segment) >= 2 and not segment[1].startswith("-"):
             if _expand_word(segment[1], variables) is None:
                 shell_directory, unresolved_word = None, segment[1]
@@ -739,25 +757,35 @@ def parse_git_invocations(command: str, base_directory: str) -> list[GitInvocati
                 shell_directory = _join_directory(shell_directory, segment[1], variables)
                 if shell_directory is not None:
                     unresolved_word = None
-            return
-        for index, token in enumerate(segment):
-            if not _is_git_word(token):
-                continue
-            parsed = _parse_one_invocation(
-                segment, index, shell_directory, unresolved_word, variables
-            )
-            if parsed is not None:
-                invocations.append(parsed)
-            return  # one command per segment; the first `git` in it is that command
+            return None
+        return list(segment), shell_directory, unresolved_word, variables
 
     for token in command_tokens(swallow_substitutions(command)):
         if _is_separator(token):
-            flush()
+            settled = settle()
             segment = []
+            if settled is not None:
+                yield settled
             continue
         segment.append(token)
-    flush()
+    settled = settle()
+    if settled is not None:
+        yield settled
 
+
+def parse_git_invocations(command: str, base_directory: str) -> list[GitInvocation]:
+    """Every `git <subcommand>` in `command`, each tagged with where it will run."""
+    invocations: list[GitInvocation] = []
+    for segment, directory, unresolved_word, variables in iter_command_segments(
+        command, base_directory
+    ):
+        for index, token in enumerate(segment):
+            if not _is_git_word(token):
+                continue
+            parsed = _parse_one_invocation(segment, index, directory, unresolved_word, variables)
+            if parsed is not None:
+                invocations.append(parsed)
+            break  # one command per segment; the first `git` in it is that command
     return invocations
 
 
@@ -798,6 +826,206 @@ def _parse_one_invocation(
         )
 
     return None
+
+
+# ------------------------------------------------------------ the Flow merge (AP3)
+#
+# A merge is a prompt in every client and a visible note in none -- unless the repo it
+# lands in has opted in to Flow. `origin/main`'s `.claude/autonomy.json` saying
+# `"mode": "programs"` AND `"sessions": "flow"` is that opt-in (docs/doctrine/
+# flow-and-programmes.md; scripts/check_autonomy.py reads the same two keys). Then the
+# per-merge go is replaced by the Flow check, and this hook returns a note, not an ask.
+#
+# WHAT THIS DOES NOT DO: it does not run the Flow check, and its note says so. It only
+# stops contradicting a decision already taken: asking for a go the project's own switch
+# says is not wanted. Every other guarded action asks exactly as before.
+#
+# EVERY DOUBT IS AN ASK. The merge keeps its ask unless this code positively proved all of:
+#   * the command is a plain `gh pr merge`, every occurrence of that text in the command
+#     parsed as one (so `bash -c "gh pr merge 1"` and a quoted mention both still ask);
+#   * no `--auto` (enabling auto-merge lands code later with no look) and no `--admin`
+#     (bypasses the repo's branch protection);
+#   * the directory it runs in is known and is a git repository -- read from a `cd`, from
+#     the payload's cwd, never from this session's own repo by default;
+#   * an explicit repo (`-R`, a PR URL, or the MCP tool's owner/repo) matches that
+#     repository's own `origin` -- otherwise this hook has no switch to read for it;
+#   * `git show origin/main:.claude/autonomy.json` there succeeded inside the time budget,
+#     parsed as a JSON object, and carries both values. A file in the working tree that is
+#     not on origin/main does not count: that is a branch's claim, not the project's.
+#
+# Known limits, recorded rather than rediscovered: origin/main is whatever was last
+# fetched, so a switch turned off upstream still reads as on until the next fetch; a bare
+# `gh pr merge 12` is taken to mean `origin`, although gh may default to another remote; a
+# project whose trunk is not `main` never flows here.
+
+AUTONOMY_REF = "origin/main:.claude/autonomy.json"
+FLOW_MODE_VALUE = "programs"
+FLOW_SESSIONS_VALUE = "flow"
+FLOW_MERGE_NOTE = (
+    "Ship guard: this repository's origin/main has Flow switched on for sessions "
+    "(autonomy.json: programs + flow), so this merge is not asked about. That is not a "
+    "clearance: the merge still needs the Flow check to say Flow, CI green and "
+    "pr-adversary APPROVE. A 'gated' said in this session, or the flow:hold label, "
+    "still means stop."
+)
+
+# `owner/repo` out of an origin URL: https, ssh and scp forms, with or without `.git`.
+GITHUB_REMOTE = re.compile(
+    r"github\.com[:/]+(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+?)(?:\.git)?/?$", re.IGNORECASE
+)
+GITHUB_PULL_URL = re.compile(
+    r"^https?://github\.com/(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+)/pull/\d+/?$", re.IGNORECASE
+)
+
+
+def _is_gh_word(token: str) -> bool:
+    base = os.path.basename(token.replace("\\", "/")).lower()
+    return base in ("gh", "gh.exe")
+
+
+def out_of_time(deadline: float, timed_out_before: int) -> bool:
+    """True once the budget is spent or a git call has timed out since `timed_out_before`."""
+    return time.monotonic() >= deadline or len(TIMED_OUT_GIT_CALLS) > timed_out_before
+
+
+def origin_slug(repo_root: str) -> str | None:
+    """`owner/repo`, lower-cased, from the repo's own `remote.origin.url`, or None.
+
+    The raw config value, not `git remote get-url`: that applies `insteadOf` rewrites, and
+    what must be compared is the GitHub name the repo is registered under.
+    """
+    code, url = git(repo_root, "config", "--get", "remote.origin.url")
+    if code != 0 or not url:
+        return None
+    match = GITHUB_REMOTE.search(url)
+    if match is None:
+        return None
+    return f"{match.group('owner')}/{match.group('repo')}".lower()
+
+
+def flow_switch_on(repo_root: str, deadline: float) -> bool:
+    """True only when origin/main's autonomy file in `repo_root` turns session Flow on.
+
+    Anything else is False: no origin/main, no file, a file only in the working tree, text
+    that is not a JSON object, either value missing or different, a git call that timed out
+    or ran past `deadline`. See the section comment for why every doubt is an ask.
+    """
+    timed_out_before = len(TIMED_OUT_GIT_CALLS)
+    if out_of_time(deadline, timed_out_before):
+        return False
+    code, text = git(repo_root, "show", AUTONOMY_REF)
+    if code != 0 or out_of_time(deadline, timed_out_before):
+        return False
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return False
+    return (
+        isinstance(data, dict)
+        and data.get("mode") == FLOW_MODE_VALUE
+        and data.get("sessions") == FLOW_SESSIONS_VALUE
+    )
+
+
+class GhMerge:
+    """One `gh pr merge` found in a Bash command, with the directory it will run in."""
+
+    def __init__(self, directory: str | None, repo: str | None, risky_flag: bool) -> None:
+        self.directory = directory
+        self.repo = repo  # lower-cased `owner/repo` the command names itself, if any
+        self.risky_flag = risky_flag  # --auto or --admin
+
+
+def _parse_gh_merge(words: list[str], directory: str | None) -> GhMerge | None:
+    """The `gh pr merge` in one command segment, or None when it is not one.
+
+    Reads the explicit repo from `-R <repo>`, `--repo <repo>`, `--repo=<repo>` or a PR URL.
+    A flag's value that merely looks like one of those -- `-b "https://github.com/x/y/pull/1"`
+    -- reads as an explicit repo that will not match, which asks: the error direction is the
+    safe one.
+    """
+    for index, word in enumerate(words):
+        if _is_gh_word(word) and words[index + 1:index + 3] == ["pr", "merge"]:
+            break
+    else:
+        return None
+
+    repo: str | None = None
+    risky = False
+    args = words[index + 3:]
+    position = 0
+    while position < len(args):
+        arg = args[position]
+        if arg in ("-R", "--repo") and position + 1 < len(args):
+            repo = args[position + 1].lower()
+            position += 2
+            continue
+        if arg.startswith("--repo="):
+            repo = arg[len("--repo="):].lower()
+        elif arg in ("--auto", "--admin") or arg.startswith(("--auto=", "--admin=")):
+            risky = True
+        else:
+            url = GITHUB_PULL_URL.match(arg)
+            if url:
+                repo = f"{url.group('owner')}/{url.group('repo')}".lower()
+        position += 1
+    return GhMerge(directory, repo, risky)
+
+
+def parse_gh_merges(command: str, base_directory: str) -> list[GhMerge]:
+    """Every `gh pr merge` in `command`, each tagged with where it will run."""
+    merges: list[GhMerge] = []
+    for words, directory, _, _ in iter_command_segments(command, base_directory):
+        parsed = _parse_gh_merge(words, directory)
+        if parsed is not None:
+            merges.append(parsed)
+    return merges
+
+
+def _merge_target_flows(
+    directory: str | None, repo: str | None, risky: bool, deadline: float
+) -> bool:
+    """One merge's verdict: the repo at `directory`, which must be the named `repo` if any."""
+    if directory is None or risky:
+        return False
+    root = repo_root_of(directory)
+    if root is None:
+        return False
+    if repo is not None and origin_slug(root) != repo:
+        return False
+    return flow_switch_on(root, deadline)
+
+
+def merge_mentions_unparsed(command: str, merges: list[GhMerge]) -> bool:
+    """True when the command's text says `gh pr merge` more often than the parser found a
+    merge: some mention was not recognised as a command (a quoted string, an `sh -c`
+    argument) and so was not judged."""
+    return len(MERGE_TEXT_PATTERN.findall(command)) != len(merges)
+
+
+def gh_merge_flows(command: str, base_directory: str, deadline: float) -> bool:
+    """True when `command` holds at least one `gh pr merge` and every one of them flows.
+
+    The count of parsed merges must equal the count of `gh pr merge` in the raw text:
+    a mention this parser did not recognise as a command (inside a quoted string, an
+    `sh -c` argument) means some merge here was not judged, so nothing is relaxed.
+    """
+    merges = parse_gh_merges(command, base_directory)
+    if not merges or merge_mentions_unparsed(command, merges):
+        return False
+    return all(
+        _merge_target_flows(merge.directory, merge.repo, merge.risky_flag, deadline)
+        for merge in merges
+    )
+
+
+def mcp_merge_flows(tool_input: dict, base_directory: str, deadline: float) -> bool:
+    """The MCP merge tool's verdict. It names a GitHub repo, so that repo must be the one
+    at `base_directory` (compared through its origin) for the switch to be readable."""
+    owner, repo = tool_input.get("owner"), tool_input.get("repo")
+    if not isinstance(owner, str) or not isinstance(repo, str) or not owner or not repo:
+        return False
+    return _merge_target_flows(base_directory, f"{owner}/{repo}".lower(), False, deadline)
 
 
 # ------------------------------------------------------------------- repo state
@@ -1265,13 +1493,36 @@ def _ask(reason: str) -> dict:
     }
 
 
+def _flow_deadline() -> float:
+    """A fresh time limit for one Flow-merge read, with the timed-out-git list emptied so
+    flow_switch_on judges only its own calls. repo_reasons() empties it again on entry."""
+    TIMED_OUT_GIT_CALLS.clear()
+    return time.monotonic() + wall_clock_budget()
+
+
 def evaluate(payload: dict) -> dict | None:
     """The hook's whole decision. None means stay silent and let the command run."""
     tool_name = payload.get("tool_name")
 
+    # This is the TARGET root's starting point, not the session's own -- see the module
+    # docstring's A23 paragraph in REPO_CHECKS. It stays sourced from the payload/harness
+    # deliberately: `hook_directory()` cannot stand in for "where will the Bash tool's
+    # shell actually run this command", only for "where does this session live".
+    base_directory = (
+        payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    )
+
     # The MCP arms come first and return outright: they share no machinery with the Bash
     # path below, which parses a command string these tool calls do not have.
     if tool_name in MCP_MERGE_TOOLS:
+        if (
+            isinstance(base_directory, str)
+            and base_directory
+            and mcp_merge_flows(
+                payload.get("tool_input") or {}, base_directory, _flow_deadline()
+            )
+        ):
+            return {"systemMessage": FLOW_MERGE_NOTE}
         return _ask(MCP_MERGE_REASON)
     if tool_name in MCP_MAIN_WRITE_TOOLS:
         reason = _mcp_main_write_reason(payload.get("tool_input") or {})
@@ -1287,32 +1538,39 @@ def evaluate(payload: dict) -> dict | None:
         return None
 
     reasons: list[str] = []
+    notes: list[str] = []
     text_reason = find_reason(command)
+    if (
+        text_reason == MERGE_REASON
+        and isinstance(base_directory, str)
+        and base_directory
+        and gh_merge_flows(command, base_directory, _flow_deadline())
+    ):
+        # AP3: the repo's own switch says Flow. The merge is noted, not asked about; any
+        # other guarded text pattern in the same command is still looked for.
+        notes.append(FLOW_MERGE_NOTE)
+        text_reason = find_reason(command, excluding=(MERGE_REASON,))
     if text_reason:
         reasons.append(text_reason)
 
-    # This is the TARGET root's starting point, not the session's own -- see the module
-    # docstring's A23 paragraph in REPO_CHECKS. It stays sourced from the payload/harness
-    # deliberately: `hook_directory()` cannot stand in for "where will the Bash tool's
-    # shell actually run this command", only for "where does this session live".
-    base_directory = (
-        payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
-    )
     notice: str | None = None
     if isinstance(base_directory, str) and base_directory:
         found, notice = repo_reasons(command, base_directory)
         reasons.extend(found)
+    if notice:
+        notes.append(notice)
 
     if not reasons:
-        # Checks cut short with nothing found: say so, without a decision -- Pete,
-        # 2026-10-13: a visible warning, not a block (docs/plan-guard-ship-time-budget-V0-1.md).
-        return {"systemMessage": notice} if notice else None
+        # A Flow note, or checks cut short with nothing found: say so, without a decision
+        # -- Pete, 2026-10-13: a visible warning, not a block
+        # (docs/plan-guard-ship-time-budget-V0-1.md).
+        return {"systemMessage": "\n\n".join(notes)} if notes else None
 
     # One prompt carrying every reason, rather than the first one winning: a command that
     # commits onto main in someone else's primary checkout has two separate problems, and
-    # fixing only the one it happened to mention would be worse than useless. A notice
-    # rides along: running out of time never downgrades an ask already earned.
-    return _ask("\n\n".join([*reasons, notice] if notice else reasons))
+    # fixing only the one it happened to mention would be worse than useless. Notes ride
+    # along: running out of time never downgrades an ask already earned.
+    return _ask("\n\n".join([*reasons, *notes]))
 
 
 # The literal strings that make a crashed-on payload worth speaking up about. Substrings,
