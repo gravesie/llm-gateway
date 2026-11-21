@@ -1,147 +1,20 @@
 # llm-gateway: project development rules
 
-Supplements the global `~/.claude/CLAUDE.md`. Everything here is committed, so it
-applies from any client — including a session started on claude.ai, which cannot see
-anything in `~/.claude`.
-
-## The deploy contract
-
-**Merging to `main` is the deploy.** CI runs lint and the full suite on every pull
-request; on merge it runs them again and then deploys. There is no manual deploy step
-and no reason to SSH to production. See `DEPLOY.md` — that file is the single source of
-truth, and if it ever disagrees with `.github/workflows/ci.yml`, the workflow is right
-and the doc is the bug.
-
-Merging itself requires an explicit go from Pete in the session. A green suite is not
-authorisation to merge.
-
-## Escalation list
-
-The point of this list is that unattended work has *known bounds*, rather than depending
-on a case-by-case judgement about what counts as important. Follow it literally.
-
-**Proceed without asking:**
-
-- Read anything in the repo.
-- Write and edit code, tests and docs within the session's agreed work unit.
-- Run the test suite, the linter, and local database migrations.
-- Restart the local dev server.
-- Create a branch, commit locally, push the session branch, open the pull request.
-- Create a git worktree for this session instead of reusing a shared checkout.
-- Install a dependency that is already pinned in the project's lockfile or manifest.
-
-**Stop and ask:**
-
-- Adding a new third-party dependency.
-- Creating a new database migration.
-- Anything touching authentication, payments, secrets, or a spend cap.
-- Deleting or rewriting an existing test.
-- Work outside the agreed scope of this session — flag it, don't absorb it.
-- `gh pr merge`, pushing to `main`, force-pushing.
-- Any action against production.
-- Changing CI/CD configuration.
-- Reading or rotating a secret.
-
-`.claude/hooks/guard_ship.py`, a PreToolUse hook, watches for the git and production
-items above — merging, pushing to a protected branch, force-pushing, writing history onto
-a protected branch (`commit`, `merge`, `cherry-pick`, `revert`, `rebase`, `pull`) or
-force-moving one (`branch -f`/`-M`, `checkout -B`, `switch -C`), `update-ref` on any
-branch, the history writers plus `reset`, `checkout`/`switch`, `restore`, `stash` and
-`clean` in someone else's primary checkout, running the deploy script by hand, and SSH to
-production. It resolves the repo the command actually targets, so a `cd` or `git -C` into
-another project is covered too; when the shell decides the target (an unknown variable,
-`$(…)`), it asks. It also covers the GitHub MCP equivalents by tool name —
-`merge_pull_request` always, and `push_files`/`create_or_update_file`/`delete_file` when
-the target branch is `main` or absent — which is why its `settings.json` matcher names
-those tools alongside `Bash`. Change the two together; a tool the matcher omits never
-invokes the hook at all. Not covered: `reset` on your own protected branch (the routine
-sync), deleting a branch, `add`/`rm`/`mv`/`apply` in another checkout, and any merge path
-that is neither a shell command nor one of those four MCP tools — your client may have
-its own. **It warns, it does not block**: measured,
-it fires and names the repo, branch and reason as a visible message in both auto-accept
-and manual permission modes, but in an auto-accept permission mode the action proceeds
-regardless of the `ask` it returns. Treat its message as a cue to stop yourself, not as
-something that stops for you. Changing CI config and handling secrets are on you to stop
-for; no hook can recognise them from a command line.
-
-`.claude/hooks/stop_gate.py`, a Stop hook, checks two turn-level invariants at the end of
-every turn: the work is on a branch rather than on `main`, and the branch's first commit
-is the plan, on its own, before any code (matching `docs/*plan*.md`, or carrying a
-`Plan-exempt: <reason>` trailer). Those are the two things that make an unwatched session
-recoverable — if it dies, `main` is clean and the intent is in git. It blocks exactly once
-per stop-chain and then lets the turn end, so it is one recorded nudge, not a wall. It
-does not judge whether the code is correct; nothing deterministic can.
-
-## Talking to Pete
-
-Pete did not write the code. Anything addressed to him (a question, a decision, a
-blocker, a review verdict, a to-do item, a PR summary, a session hand-off) is written for
-one of two readers:
-- Technical issue: an experienced CIO who knows how the system is used in the
-  organisation, but not its internals.
-- Business issue: the business owner, non-technical, who cares about customers, sales,
-  cost and risk.
-
-Rules:
-- No function, file, variable, table, test or library names. No line numbers, no code.
-  Name things by what a user sees or does: "the sign-in email", "the approval screen",
-  "this morning's Cornwall post". The one exception is a file or folder Pete has to open:
-  see the next rule.
-- Any file or folder you point Pete to (because you think he should check it, read it or
-  give feedback on it), in a message, plan, table, summary or hand-off: give the full path
-  starting with `C:\`, on every mention, including each row of a table. Never a bare name,
-  slug or relative path, and never "24 drafts in four folders" without the paths. This
-  overrides the rule above, because Pete needs to open the file. When you tell him a file
-  has been created, the same applies.
-- Every item follows this shape, in this order:
-  1. What I need from you: the decision, yes/no or action, in one line.
-  2. What happens now: what a user sees or experiences today. Show an example if it helps.
-  3. If we make this change: what users will see that is different, and what it costs in
-     time or money.
-  4. If we don't: the concrete problem: who hits it, how likely it is, how bad it is.
-  5. My recommendation.
-- Technical detail (reproductions, line numbers, internal file paths) goes to whoever fixes
-  it, or into the PR description. It does not go in the message to Pete. Give it if he
-  asks. A file Pete must open is not internal detail: give its full path.
-- Never relay a subagent's report verbatim. Translate it into this shape first.
-- "Terse" means short, not technical. Keep every fact that bears on the decision; drop
-  the internals.
-
-## Concurrent sessions
-
-One working tree per session — never run two sessions against the same checkout. Verify
-`git branch --show-current` before branching; the session-start snapshot can be stale if
-another session moved the tree since it was taken. Use `git worktree add -b <branch>
-<sibling-path> main`. What a fresh worktree needs beyond the checkout itself —
-dependency installs, `.env`, local data directories — is project-specific; see
-"Fresh worktree" below.
-
-## Planning
-
-Enter plan mode before writing code when the change is multi-file, or touches database
-schema, auth, payments or deploy. Single-file, clearly-scoped changes do not need it —
-state the understanding and approach in a sentence or two and go.
+The process rules (deploy contract, escalation list, Flow pointer, planning, verifying,
+session shape) are in `.claude/rules/dev-process.md`, carried verbatim from dev-process and
+loaded every session. Never edit that copy. This file holds only this project's facts and
+rules; it may add stops but never remove one.
 
 ## Verifying a change
 
 - Tests: `python -m pytest` — the full suite. A red test is a real regression, not noise.
 - Lint: `python -m ruff check src tests` — must be clean.
 - No dev server, no port. This is a library, exercised through its test suite.
-- Local ports: before giving or writing any command, config or doc that names a local port
-  (the dev server, a database connection, or a port a container publishes), read it from `PORTS.md` on the dev-process repo's origin/main (`git show origin/main:PORTS.md`
-  if the checkout is behind). Never quote a port from memory or from a project file alone. If
-  this project's config disagrees with `PORTS.md`, say so. Never pick or change a port here
-  without editing that file first. Record: `docs/doctrine/local-ports.md` (dev-process).
 - After changing the package, reinstall it in the venv (`pip install -e .`) before
   running anything that imports it. A stale install is this project's version of a
   stale dev server.
 - Provider calls in tests are mocked. A test that makes a real API call costs money
   every time the suite runs and must not be merged.
-
-## Session shape
-
-One session = one work unit = one PR. When the work unit is done, wrap up rather than
-starting the next job in the same thread.
 
 ## Project-specific rules
 
@@ -169,6 +42,16 @@ fallback to a direct provider call.
 
 **Cost figures are the product.** A bug that misattributes spend is as serious as one that
 crashes. The only reason this library exists is to be believed.
+
+`.claude/hooks/stop_gate.py`, a Stop hook, checks two turn-level invariants at the end of
+every turn: the work is on a branch rather than on `main`, and the branch's first commit
+is the plan, on its own, before any code (matching `docs/*plan*.md`, or carrying a
+`Plan-exempt: <reason>` trailer). Those are the two things that make an unwatched session
+recoverable — if it dies, `main` is clean and the intent is in git. It blocks exactly once
+per stop-chain and then lets the turn end, so it is one recorded nudge, not a wall. It
+does not judge whether the code is correct; nothing deterministic can.
+
+What a fresh worktree needs beyond the checkout itself is in "Fresh worktree" below.
 
 ## Fresh worktree
 
